@@ -34,7 +34,7 @@ from tkinter import (
 # --------------------------------------------------------------------------------------
 
 APP_NAME = "Wildcat77 Launcher"
-LAUNCHER_VERSION = "1.3.0"
+LAUNCHER_VERSION = "1.0.0"
 
 CONFIG_FILE = "launcher_config.json"
 MODPACKS_DIR = "modpacks"
@@ -43,7 +43,7 @@ MODPACKS_DIR = "modpacks"
 INSTALL_DIR = Path(__file__).resolve().parent
 
 # Java runtime configuration
-JAVA_RUNTIME_DIR_NAME = "java-runtime"
+JAVA_RUNTIME_DIR_NAME = "runtime"
 JAVA_RUNTIME_VERSION = "21.0.7"  # version we expect
 JAVA_RUNTIME_VERSION_FILE = "java_runtime_version.txt"
 
