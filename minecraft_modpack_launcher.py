@@ -155,7 +155,7 @@ def get_available_forge_versions(mc_version: str) -> list:
     """Fetch available Forge versions for a given Minecraft version.
     Returns a list of version strings, sorted newest first."""
     try:
-        url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+        url = f"https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
         with urllib.request.urlopen(url) as resp:
             promotions = json.loads(resp.read().decode("utf-8"))
         
@@ -308,7 +308,7 @@ def download_forge_installer(mc_version: str, logger, forge_version: str = "") -
         logger(f"Fetching Forge releases for MC {mc_version}...")
         
         # Use Forge API to find the right version
-        url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+        url = f"https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
         with urllib.request.urlopen(url) as resp:
             promotions = json.loads(resp.read().decode("utf-8"))
         
