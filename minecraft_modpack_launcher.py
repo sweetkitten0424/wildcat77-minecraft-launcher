@@ -4,9 +4,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 import urllib.error
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from tkinter import (
@@ -38,6 +40,7 @@ LAUNCHER_VERSION = "1.0.0"
 
 CONFIG_FILE = "launcher_config.json"
 MODPACKS_DIR = "modpacks"
+MODPACK_METADATA_FILE = "modpack.json"  # Per-modpack loader config
 
 # Installation directory (this is USERDIR)
 INSTALL_DIR = Path(__file__).resolve().parent
@@ -59,10 +62,9 @@ JAVA_RUNTIME_ZIP_URL = (
     "https://download.oracle.com/java/21/latest/jdk-21_windows-x64_bin.zip"
 )
 
-# CurseForge API key (hard-coded).
-# WARNING: Anyone who can read this file can see your key.
-# Replace the placeholder with your real key string.
-CURSEFORGE_API_KEY = "$2a$10$5R7Sc1GxclJVk3tiNEVytexYE599JRnSncKGANk7JdYMErAq3xDgy"
+# Parallel downloads configuration
+PARALLEL_DOWNLOADS_ENABLED = True  # Enable parallel downloads by default
+MAX_PARALLEL_DOWNLOADS = 50  # Number of concurrent download threads
 
 
 def load_config():
@@ -77,6 +79,7 @@ def load_config():
             "auth_access_token": "0",
             "user_type": "mojang",
             "version_type": "release",
+            "curseforge_api_key": "",
         }
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -89,6 +92,7 @@ def load_config():
     data.setdefault("auth_access_token", "0")
     data.setdefault("user_type", "mojang")
     data.setdefault("version_type", "release")
+    data.setdefault("curseforge_api_key", "")
     return data
 
 
@@ -108,6 +112,377 @@ def list_modpacks():
         if p.is_dir():
             entries.append(p.name)
     return entries
+
+
+# --------------------------------------------------------------------------------------
+# Modpack metadata (loader config)
+# --------------------------------------------------------------------------------------
+
+def load_modpack_metadata(modpack_dir: Path) -> dict:
+    """Load modpack.json or return default config."""
+    metadata_file = modpack_dir / MODPACK_METADATA_FILE
+    if metadata_file.exists():
+        try:
+            with open(metadata_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    
+    return {
+        "loader": "vanilla",  # vanilla, forge, fabric, neoforge
+        "loader_version": "",
+        "minecraft_version": "",
+    }
+
+
+def save_modpack_metadata(modpack_dir: Path, metadata: dict):
+    """Save modpack.json."""
+    metadata_file = modpack_dir / MODPACK_METADATA_FILE
+    with open(metadata_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4)
+
+
+# --------------------------------------------------------------------------------------
+# Forge/Fabric loader management
+# --------------------------------------------------------------------------------------
+
+def get_loaders_dir() -> Path:
+    """Directory to cache downloaded loaders."""
+    return INSTALL_DIR / "loaders"
+
+
+def get_available_forge_versions(mc_version: str) -> list:
+    """Fetch available Forge versions for a given Minecraft version.
+    Returns a list of version strings, sorted newest first."""
+    try:
+        url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+        with urllib.request.urlopen(url) as resp:
+            promotions = json.loads(resp.read().decode("utf-8"))
+        
+        promos = promotions.get("promos", {})
+        versions = []
+        
+        # Collect all versions for this MC version
+        for key, version in promos.items():
+            if key.startswith(f"{mc_version}-"):
+                if version not in versions:
+                    versions.append(version)
+        
+        # Sort by version (reverse numeric order)
+        try:
+            versions.sort(key=lambda x: [int(n) for n in x.split(".")], reverse=True)
+        except:
+            versions.reverse()
+        
+        return versions if versions else ["latest"]
+    except Exception:
+        return ["latest"]
+
+
+def get_available_neoforge_versions(mc_version: str) -> list:
+    """Fetch available NeoForge versions for a given Minecraft version.
+    Returns a list of version strings, sorted newest first."""
+    try:
+        url = f"https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml"
+        with urllib.request.urlopen(url) as resp:
+            content = resp.read().decode("utf-8")
+        
+        # Parse version numbers from maven-metadata.xml
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(content)
+        
+        versions = []
+        for version_elem in root.findall(".//version"):
+            version = version_elem.text
+            if version:
+                # NeoForge versions are like "21.0.35-beta", "20.4.109", etc
+                # Check if this version supports the target MC version
+                parts = version.split(".")
+                if parts and parts[0] == mc_version.split(".")[0]:  # Match major version
+                    if version not in versions:
+                        versions.append(version)
+        
+        # Sort by version (reverse numeric order)
+        try:
+            versions.sort(key=lambda x: [int(n) for n in x.split(".")[0:2]], reverse=True)
+        except:
+            versions.reverse()
+        
+        return versions[:15] if versions else ["latest"]  # Return top 15 versions
+    except Exception:
+        return ["latest"]
+
+
+def get_available_fabric_versions(mc_version: str) -> list:
+    """Fetch available Fabric loader versions for a given Minecraft version.
+    Returns a list of (loader_version, installer_version) tuples."""
+    try:
+        # Get available loaders
+        url = "https://meta.fabricmc.net/v2/versions/loader"
+        with urllib.request.urlopen(url) as resp:
+            loaders = json.loads(resp.read().decode("utf-8"))
+        
+        # Get available installers
+        url = "https://meta.fabricmc.net/v2/versions/installer"
+        with urllib.request.urlopen(url) as resp:
+            installers = json.loads(resp.read().decode("utf-8"))
+        
+        if not loaders or not installers:
+            return [("latest", "latest")]
+        
+        # Return top 10 loader versions paired with latest installer
+        latest_installer = installers[0]["version"]
+        versions = []
+        for loader in loaders[:10]:
+            loader_version = loader.get("version", "")
+            if loader_version:
+                versions.append((loader_version, latest_installer))
+        
+        return versions if versions else [("latest", "latest")]
+    except Exception:
+        return [("latest", "latest")]
+
+
+def _wait_for_manual_loader(loaders_dir: Path, search_pattern: str, logger) -> Path:
+    """
+    Wait for user to manually place a loader file in the loaders directory.
+    Shows a message box instructing the user, then polls the directory.
+    
+    Args:
+        loaders_dir: Path to the loaders directory
+        search_pattern: Partial filename to search for (e.g., "forge-", "fabric-", "neoforge-")
+        logger: Logger function
+    
+    Returns:
+        Path to the found loader file
+        
+    Raises:
+        RuntimeError: If user cancels the operation
+    """
+    loaders_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Show message asking user to place loader
+    result = messagebox.askyesno(
+        "Manual Loader Required",
+        f"Could not auto-download the modloader.\n\n"
+        f"Please place the modloader .jar file in:\n{loaders_dir}\n\n"
+        f"Once placed, click 'Yes' to continue.",
+    )
+    
+    if not result:
+        raise RuntimeError("User cancelled modloader installation")
+    
+    # Poll the loaders directory for the file
+    logger(f"Waiting for modloader to be placed in {loaders_dir}...", source="LAUNCHER")
+    
+    max_wait_time = 300  # 5 minutes timeout
+    elapsed = 0
+    poll_interval = 1  # Check every 1 second
+    
+    while elapsed < max_wait_time:
+        # Look for matching files in loaders directory
+        for file in loaders_dir.glob("*.jar"):
+            if search_pattern in file.name:
+                logger(f"Found modloader: {file.name}", source="LAUNCHER")
+                return file
+        
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        
+        # Show progress message every 5 seconds
+        if elapsed % 5 == 0:
+            logger(f"Still waiting for modloader ({elapsed}s)...", source="LAUNCHER")
+    
+    raise RuntimeError(
+        f"Timeout waiting for modloader file in {loaders_dir} (5 minutes)\n"
+        f"Please place a .jar file matching '{search_pattern}' in that directory"
+    )
+
+
+def download_forge_installer(mc_version: str, logger, forge_version: str = "") -> Path:
+    """Download Forge installer for the given Minecraft version and optional Forge version."""
+    loaders_dir = get_loaders_dir()
+    loaders_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        logger(f"Fetching Forge releases for MC {mc_version}...")
+        
+        # Use Forge API to find the right version
+        url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+        with urllib.request.urlopen(url) as resp:
+            promotions = json.loads(resp.read().decode("utf-8"))
+        
+        promos = promotions.get("promos", {})
+        
+        # If specific version not provided, get latest
+        if not forge_version or forge_version == "latest":
+            key = f"{mc_version}-latest"
+            if key not in promos:
+                raise RuntimeError(f"No Forge releases found for MC {mc_version}")
+            forge_version = promos[key]
+        
+        logger(f"Found Forge version {forge_version} for MC {mc_version}")
+        
+        # Construct download URL
+        installer_url = (
+            f"https://maven.minecraftforge.net/net/minecraftforge/forge/"
+            f"{mc_version}-{forge_version}/forge-{mc_version}-{forge_version}-installer.jar"
+        )
+        
+        installer_name = f"forge-{mc_version}-{forge_version}-installer.jar"
+        installer_path = loaders_dir / installer_name
+        
+        if installer_path.exists():
+            logger(f"Forge installer already cached: {installer_name}")
+            return installer_path
+        
+        logger(f"Downloading Forge installer {installer_name}...")
+        download_to_file(installer_url, installer_path)
+        
+        return installer_path
+    
+    except Exception as e:
+        logger(f"Failed to download Forge: {e}", source="LAUNCHER")
+        logger(f"Looking for manually placed Forge installer in {loaders_dir}...", source="LAUNCHER")
+        
+        # Check if a Forge installer already exists in the loaders directory
+        for file in loaders_dir.glob("forge-*.jar"):
+            logger(f"Found existing Forge installer: {file.name}", source="LAUNCHER")
+            return file
+        
+        # Ask user to manually place the installer
+        logger(f"No existing Forge installer found. Asking user to place one...", source="LAUNCHER")
+        return _wait_for_manual_loader(loaders_dir, "forge-", logger)
+
+
+def download_fabric_installer(mc_version: str, logger, loader_version: str = "", installer_version: str = "") -> Path:
+    """Download Fabric installer for the given Minecraft version and optional versions.
+    
+    Args:
+        mc_version: Minecraft version
+        logger: Logger function
+        loader_version: Specific Fabric loader version (empty = latest)
+        installer_version: Specific installer version (empty = latest)
+    """
+    loaders_dir = get_loaders_dir()
+    loaders_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        logger(f"Fetching Fabric releases for MC {mc_version}...")
+        
+        # Get latest Fabric Loader version if not specified
+        url = "https://meta.fabricmc.net/v2/versions/loader"
+        with urllib.request.urlopen(url) as resp:
+            loaders = json.loads(resp.read().decode("utf-8"))
+        
+        if not loaders:
+            raise RuntimeError("No Fabric loaders found")
+        
+        if not loader_version or loader_version == "latest":
+            latest_loader = loaders[0]["version"]
+        else:
+            latest_loader = loader_version
+        logger(f"Found Fabric Loader {latest_loader}")
+        
+        # Get Installer version
+        url = "https://meta.fabricmc.net/v2/versions/installer"
+        with urllib.request.urlopen(url) as resp:
+            installers = json.loads(resp.read().decode("utf-8"))
+        
+        if not installers:
+            raise RuntimeError("No Fabric installers found")
+        
+        if not installer_version or installer_version == "latest":
+            latest_installer = installers[0]["version"]
+        else:
+            latest_installer = installer_version
+        logger(f"Found Fabric Installer {latest_installer}")
+        
+        # Download installer
+        installer_url = (
+            f"https://meta.fabricmc.net/v2/versions/loader/{mc_version}/"
+            f"{latest_loader}/installer/{latest_installer}/server.jar"
+        )
+        
+        installer_name = f"fabric-installer-{mc_version}-{latest_loader}.jar"
+        installer_path = loaders_dir / installer_name
+        
+        if installer_path.exists():
+            logger(f"Fabric installer already cached: {installer_name}")
+            return installer_path
+        
+        logger(f"Downloading Fabric installer {installer_name}...")
+        download_to_file(installer_url, installer_path)
+        
+        return installer_path
+    
+    except Exception as e:
+        logger(f"Failed to download Fabric: {e}", source="LAUNCHER")
+        logger(f"Looking for manually placed Fabric installer in {loaders_dir}...", source="LAUNCHER")
+        
+        # Check if a Fabric installer already exists in the loaders directory
+        for file in loaders_dir.glob("fabric-*.jar"):
+            logger(f"Found existing Fabric installer: {file.name}", source="LAUNCHER")
+            return file
+        
+        # Ask user to manually place the installer
+        logger(f"No existing Fabric installer found. Asking user to place one...", source="LAUNCHER")
+        return _wait_for_manual_loader(loaders_dir, "fabric-", logger)
+
+
+def download_neoforge_installer(mc_version: str, logger, neoforge_version: str = "") -> Path:
+    """Download NeoForge installer for the given Minecraft version and optional NeoForge version.
+    
+    Args:
+        mc_version: Minecraft version
+        logger: Logger function
+        neoforge_version: Specific NeoForge version (empty = latest)
+    """
+    loaders_dir = get_loaders_dir()
+    loaders_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        logger(f"Fetching NeoForge releases for MC {mc_version}...")
+        
+        # If specific version not provided, get latest
+        if not neoforge_version or neoforge_version == "latest":
+            versions = get_available_neoforge_versions(mc_version)
+            if not versions or versions == ["latest"]:
+                raise RuntimeError(f"No NeoForge releases found for MC {mc_version}")
+            neoforge_version = versions[0]
+        
+        logger(f"Found NeoForge version {neoforge_version} for MC {mc_version}")
+        
+        # Construct download URL
+        installer_url = (
+            f"https://maven.neoforged.net/releases/net/neoforged/neoforge/"
+            f"{neoforge_version}/neoforge-{neoforge_version}-installer.jar"
+        )
+        
+        installer_name = f"neoforge-{neoforge_version}-installer.jar"
+        installer_path = loaders_dir / installer_name
+        
+        if installer_path.exists():
+            logger(f"NeoForge installer already cached: {installer_name}")
+            return installer_path
+        
+        logger(f"Downloading NeoForge installer {installer_name}...")
+        download_to_file(installer_url, installer_path)
+        
+        return installer_path
+    
+    except Exception as e:
+        logger(f"Failed to download NeoForge: {e}", source="LAUNCHER")
+        logger(f"Looking for manually placed NeoForge installer in {loaders_dir}...", source="LAUNCHER")
+        
+        # Check if a NeoForge installer already exists in the loaders directory
+        for file in loaders_dir.glob("neoforge-*.jar"):
+            logger(f"Found existing NeoForge installer: {file.name}", source="LAUNCHER")
+            return file
+        
+        # Ask user to manually place the installer
+        logger(f"No existing NeoForge installer found. Asking user to place one...", source="LAUNCHER")
+        return _wait_for_manual_loader(loaders_dir, "neoforge-", logger)
 
 
 def copy_tree(src, dst):
@@ -139,6 +514,49 @@ def download_to_file(url: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as resp, open(dest, "wb") as out_f:
         shutil.copyfileobj(resp, out_f)
+
+
+def parallel_download_files(download_tasks: list, logger, max_workers: int = MAX_PARALLEL_DOWNLOADS):
+    """
+    Download multiple files in parallel.
+    
+    Args:
+        download_tasks: List of tuples (url, dest_path, description)
+        logger: Logger function
+        max_workers: Number of parallel threads
+    """
+    if not PARALLEL_DOWNLOADS_ENABLED or len(download_tasks) <= 1:
+        # Fall back to sequential downloads
+        for url, dest, desc in download_tasks:
+            try:
+                logger(f"Downloading {desc}...", source="LAUNCHER")
+                download_to_file(url, dest)
+            except Exception as e:
+                logger(f"Failed to download {desc}: {e}", source="LAUNCHER")
+                raise
+        return
+    
+    # Parallel downloads
+    def download_task(task):
+        url, dest, desc = task
+        try:
+            download_to_file(url, dest)
+            return (True, desc, None)
+        except Exception as e:
+            return (False, desc, str(e))
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(download_task, task) for task in download_tasks]
+        
+        completed = 0
+        for future in futures:
+            success, desc, error = future.result()
+            completed += 1
+            if success:
+                logger(f"Downloaded {desc} ({completed}/{len(download_tasks)})", source="LAUNCHER")
+            else:
+                logger(f"Failed to download {desc}: {error}", source="LAUNCHER")
+                raise RuntimeError(f"Failed to download {desc}: {error}")
 
 
 # --------------------------------------------------------------------------------------
@@ -256,8 +674,42 @@ def ensure_java_runtime(config, logger):
 # CurseForge / Modrinth import helpers (modpacks)
 # --------------------------------------------------------------------------------------
 
-def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path):
-    """Import a CurseForge modpack zip: extract overrides/ into the modpack."""
+def get_curseforge_file_download_url(project_id: int, file_id: int, api_key: str = "") -> str:
+    """Get download URL for a CurseForge file using the API.
+    Returns empty string if not available.
+    api_key is optional but recommended for better reliability."""
+    try:
+        # Try the API endpoint
+        url = f"https://api.curseforge.com/v1/mods/{project_id}/files/{file_id}"
+        req = urllib.request.Request(url)
+        req.add_header("Accept", "application/json")
+        
+        # Add API key if provided
+        if api_key.strip():
+            req.add_header("x-api-key", api_key)
+        
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        
+        if data.get("data"):
+            file_data = data.get("data", {})
+            download_url = file_data.get("downloadUrl")
+            return download_url or ""
+        return ""
+    except Exception as e:
+        # API might require authentication or have changed - return empty string
+        return ""
+
+
+def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path, logger, api_key: str = "") -> tuple:
+    """Import a CurseForge modpack zip: extract mods and overrides.
+    Returns (mc_version, loader, loader_version) tuple."""
+    mc_version = ""
+    loader = "vanilla"
+    loader_version = ""
+    mods_dir = dest_modpack_dir / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    
     with zipfile.ZipFile(zip_path, "r") as zf:
         namelist = zf.namelist()
 
@@ -267,11 +719,79 @@ def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path):
                 manifest_name = name
                 break
 
+        download_tasks = []
+        mods_extracted = 0
+        
         if manifest_name:
             with zf.open(manifest_name) as mf:
-                _manifest = json.loads(mf.read().decode("utf-8"))
-            # manifest currently unused
+                manifest = json.loads(mf.read().decode("utf-8"))
+                # Extract Minecraft version
+                mc_version = manifest.get("minecraft", {}).get("version", "")
+                logger(f"Detected Minecraft version: {mc_version}", source="LAUNCHER")
+                
+                # Try to detect loader from modLoaders
+                loader_info = manifest.get("minecraft", {}).get("modLoaders", [])
+                if loader_info:
+                    loader_entry = loader_info[0]
+                    loader_id = loader_entry.get("id", "")
+                    if "neoforge" in loader_id.lower():
+                        loader = "neoforge"
+                        loader_version = loader_id.split("-")[-1] if "-" in loader_id else ""
+                        logger(f"Detected NeoForge loader: {loader_version}", source="LAUNCHER")
+                    elif "forge" in loader_id.lower():
+                        loader = "forge"
+                        loader_version = loader_id.split("-")[-1] if "-" in loader_id else ""
+                        logger(f"Detected Forge loader: {loader_version}", source="LAUNCHER")
+                    elif "fabric" in loader_id.lower():
+                        loader = "fabric"
+                        loader_version = loader_id.split("-")[-1] if "-" in loader_id else ""
+                        logger(f"Detected Fabric loader: {loader_version}", source="LAUNCHER")
+                
+                # Collect mod download tasks from manifest
+                files = manifest.get("files", [])
+                for file_info in files:
+                    project_id = file_info.get("projectID")
+                    file_id = file_info.get("fileID")
+                    required = file_info.get("required", True)
+                    
+                    if not project_id or not file_id:
+                        continue
+                    
+                    # Try to get download URL from API
+                    download_url = get_curseforge_file_download_url(project_id, file_id, api_key)
+                    if download_url:
+                        # Extract filename from URL
+                        filename = download_url.split("/")[-1] or f"mod_{project_id}_{file_id}.jar"
+                        target = mods_dir / filename
+                        download_tasks.append((download_url, target, f"{filename} (proj:{project_id})"))
+                    else:
+                        # Log warning but don't fail - mod might be optional
+                        if required:
+                            logger(f"Warning: Could not get download URL for mod {project_id}/{file_id}", source="LAUNCHER")
 
+        # First, try to extract mods from the ZIP if they exist
+        mods_prefix = "mods/"
+        for name in namelist:
+            if name.startswith(mods_prefix) and name.endswith(".jar"):
+                rel = name[len(mods_prefix):]
+                target = mods_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                logger(f"Extracting mod from archive: {rel}", source="LAUNCHER")
+                with zf.open(name) as src, open(target, "wb") as out_f:
+                    shutil.copyfileobj(src, out_f)
+                mods_extracted += 1
+
+        # Download any additional mods from manifest
+        if download_tasks:
+            logger(f"Downloading {len(download_tasks)} mods from CurseForge (extracted {mods_extracted} from archive)...", source="LAUNCHER")
+            parallel_download_files(download_tasks, logger)
+        else:
+            if mods_extracted > 0:
+                logger(f"Extracted {mods_extracted} mods from modpack archive.", source="LAUNCHER")
+            else:
+                logger(f"No mods found in modpack.", source="LAUNCHER")
+
+        # Extract overrides
         overrides_prefix = "overrides/"
         for name in namelist:
             if name.startswith(overrides_prefix) and not name.endswith("/"):
@@ -280,10 +800,17 @@ def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(name) as src, open(target, "wb") as out_f:
                     shutil.copyfileobj(src, out_f)
+    
+    return mc_version, loader, loader_version
 
 
-def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
-    """Import a Modrinth .mrpack into the modpack folder."""
+def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger) -> tuple:
+    """Import a Modrinth .mrpack into the modpack folder.
+    Returns (mc_version, loader, loader_version) tuple."""
+    mc_version = ""
+    loader = "vanilla"
+    loader_version = ""
+    
     with zipfile.ZipFile(zip_path, "r") as zf:
         namelist = zf.namelist()
 
@@ -298,9 +825,38 @@ def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
 
         with zf.open(index_name) as idx_f:
             index = json.loads(idx_f.read().decode("utf-8"))
+            # Extract Minecraft version
+            mc_version = index.get("gameVersion", "")
+            logger(f"Detected Minecraft version: {mc_version}", source="LAUNCHER")
+            
+            # Detect loader from loaders array
+            loaders = index.get("loaders", [])
+            if loaders:
+                loader_entry = loaders[0]
+                loader_id = loader_entry.get("id", "")
+                loader_ver = loader_entry.get("version", "")
+                
+                if "neoforge" in loader_id.lower():
+                    loader = "neoforge"
+                    loader_version = loader_ver
+                    logger(f"Detected NeoForge loader: {loader_version}", source="LAUNCHER")
+                elif "forge" in loader_id.lower():
+                    loader = "forge"
+                    loader_version = loader_ver
+                    logger(f"Detected Forge loader: {loader_version}", source="LAUNCHER")
+                elif "fabric" in loader_id.lower():
+                    loader = "fabric"
+                    loader_version = loader_ver
+                    logger(f"Detected Fabric loader: {loader_version}", source="LAUNCHER")
 
+        # Create mods directory and prepare download tasks
+        mods_dir = dest_modpack_dir / "mods"
+        mods_dir.mkdir(parents=True, exist_ok=True)
+        
         files = index.get("files", [])
-        for i, file_info in enumerate(files, start=1):
+        download_tasks = []
+        
+        for file_info in files:
             path = file_info.get("path")
             downloads = file_info.get("downloads") or []
             if not path or not downloads:
@@ -308,12 +864,14 @@ def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
             url = downloads[0]
             target = dest_modpack_dir / path
             target.parent.mkdir(parents=True, exist_ok=True)
-            logger(f"Downloading Modrinth file {i}/{len(files)}...", source="LAUNCHER")
-            try:
-                download_to_file(url, target)
-            except Exception as e:
-                logger(f"Failed to download {url}: {e}", source="LAUNCHER")
+            download_tasks.append((url, target, path))
+        
+        # Download all files in parallel
+        if download_tasks:
+            logger(f"Starting parallel download of {len(download_tasks)} files...", source="LAUNCHER")
+            parallel_download_files(download_tasks, logger)
 
+        # Extract overrides (configs, resourcepacks, etc)
         overrides_prefix = "overrides/"
         for name in namelist:
             if name.startswith(overrides_prefix) and not name.endswith("/"):
@@ -322,6 +880,8 @@ def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(name) as src, open(target, "wb") as out_f:
                     shutil.copyfileobj(src, out_f)
+    
+    return mc_version, loader, loader_version
 
 
 # --------------------------------------------------------------------------------------
@@ -375,9 +935,10 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
     logger(f"Downloading client JAR for {version_id}...")
     download_to_file(client_url, client_jar_path)
 
+    # Download libraries in parallel
     libraries = version_data.get("libraries", [])
-    total_libs = len(libraries)
-    for i, lib in enumerate(libraries, start=1):
+    lib_tasks = []
+    for lib in libraries:
         downloads = lib.get("downloads", {})
         artifact = downloads.get("artifact")
         if not artifact:
@@ -387,9 +948,13 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
         if not path or not url:
             continue
         target = libraries_dir / Path(path)
-        logger(f"Downloading library {i}/{total_libs}...")
-        download_to_file(url, target)
+        lib_tasks.append((url, target, path))
+    
+    if lib_tasks:
+        logger(f"Downloading {len(lib_tasks)} libraries in parallel...")
+        parallel_download_files(lib_tasks, logger)
 
+    # Download assets in parallel
     asset_index_info = version_data.get("assetIndex")
     if asset_index_info:
         asset_index_url = asset_index_info["url"]
@@ -402,8 +967,8 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
         )
 
         objects = asset_index.get("objects", {})
-        total_objects = len(objects)
-        for i, (name, obj) in enumerate(objects.items(), start=1):
+        asset_tasks = []
+        for name, obj in objects.items():
             hash_ = obj["hash"]
             prefix = hash_[:2]
             url = f"{ASSET_BASE_URL}/{prefix}/{hash_}"
@@ -411,12 +976,11 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
             if target.exists():
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            if i % 50 == 0:
-                logger(f"Downloading assets {i}/{total_objects}...")
-            try:
-                download_to_file(url, target)
-            except Exception as e:
-                logger(f"Failed to download asset {name} ({url}): {e}")
+            asset_tasks.append((url, target, name))
+        
+        if asset_tasks:
+            logger(f"Downloading {len(asset_tasks)} assets in parallel...")
+            parallel_download_files(asset_tasks, logger)
 
     args_file = generate_java_args_from_version_json(
         version_id, version_data, version_root, libraries_dir, versions_dir, assets_dir, config
@@ -656,7 +1220,8 @@ class MinecraftLauncherApp:
         self.log("Console opened.", source="LAUNCHER")
 
         def on_close():
-            self.console_window.destroy()
+            if self.console_window is not None:
+                self.console_window.destroy()
             self.console_window = None
             self.console_text = None
 
@@ -670,7 +1235,7 @@ class MinecraftLauncherApp:
         self.console_text.config(state=DISABLED)
 
     def console_copy_all(self):
-        if self.console_text is None:
+        if self.console_text is None or self.console_window is None:
             return
         text = self.console_text.get("1.0", END)
         self.console_window.clipboard_clear()
@@ -742,6 +1307,12 @@ class MinecraftLauncherApp:
             settings_frame,
             "Install Vanilla Version",
             self.install_vanilla_version_dialog,
+        ).pack(side="left", padx=5)
+
+        self._mk_header_button(
+            settings_frame,
+            "Settings",
+            self.settings_dialog,
         ).pack(side="left", padx=5)
 
         main_frame = Frame(self.root, bg=self.bg_color)
@@ -992,11 +1563,19 @@ class MinecraftLauncherApp:
             else 0
         )
 
+        # Load loader metadata
+        metadata = load_modpack_metadata(mp_dir)
+        loader = metadata.get("loader", "vanilla")
+        mc_version = metadata.get("minecraft_version", "")
+
         java_exec = get_java_executable()
         args_file = self.args_file_var.get()
 
         info = [
             f"Folder: {mp_dir}",
+            "",
+            f"Loader: {loader.upper()}",
+            f"MC Version: {mc_version}" if mc_version else "MC Version: (not set)",
             "",
             f"Mods: {mods_count}",
             f"Config files: {config_count}",
@@ -1005,7 +1584,7 @@ class MinecraftLauncherApp:
             f"Java: {java_exec} (expected {JAVA_RUNTIME_VERSION})",
             f"Args file: USERDIR/vanilla/{args_file}",
             "",
-            "Tip: Drop files into this modpack's mods/config/resourcepacks folders.",
+            "Note: Manually copy/paste mods, configs, and resourcepacks into the folders above.",
         ]
         self.detail_title.config(text=modpack_name)
         self.detail_info.config(text="\n".join(info))
@@ -1015,7 +1594,7 @@ class MinecraftLauncherApp:
         dialog.title("Create Modpack")
         dialog.configure(bg=self.panel_color)
         dialog.grab_set()
-        dialog.resizable(False, False)
+        dialog.resizable(False, True)
 
         Label(
             dialog,
@@ -1039,6 +1618,147 @@ class MinecraftLauncherApp:
         entry.pack(padx=10, pady=3, fill="x")
         entry.focus_set()
 
+        Label(
+            dialog,
+            text="Loader:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 11),
+        ).pack(padx=10, pady=(10, 3), anchor="w")
+
+        loader_var = StringVar(value="vanilla")
+        loader_frame = Frame(dialog, bg=self.panel_color)
+        loader_frame.pack(padx=10, pady=3, fill="x")
+
+        self._mk_main_button(
+            loader_frame,
+            "Vanilla",
+            lambda: loader_var.set("vanilla"),
+        ).pack(side="left", padx=3)
+        self._mk_main_button(
+            loader_frame,
+            "Forge",
+            lambda: loader_var.set("forge"),
+        ).pack(side="left", padx=3)
+        self._mk_main_button(
+            loader_frame,
+            "Fabric",
+            lambda: loader_var.set("fabric"),
+        ).pack(side="left", padx=3)
+        self._mk_main_button(
+            loader_frame,
+            "NeoForge",
+            lambda: loader_var.set("neoforge"),
+        ).pack(side="left", padx=3)
+
+        Label(
+            dialog,
+            text="Minecraft Version:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).pack(padx=10, pady=(8, 3), anchor="w")
+
+        mc_ver_var = StringVar(value="1.21.1")
+        mc_entry = Entry(
+            dialog,
+            textvariable=mc_ver_var,
+            bg="#1f2616",
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            highlightthickness=1,
+            highlightbackground="#101509",
+            highlightcolor=self.accent_color,
+        )
+        mc_entry.pack(padx=10, pady=3, fill="x")
+
+        # Loader version section (initially hidden)
+        loader_version_label = Label(
+            dialog,
+            text="Loader Version:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        )
+        
+        loader_version_var = StringVar(value="latest")
+        loader_version_menu = None
+        
+        def update_loader_versions():
+            """Update available loader versions based on selected loader and MC version."""
+            nonlocal loader_version_menu
+            
+            loader = loader_var.get()
+            mc_version = mc_ver_var.get().strip()
+            
+            # Show/hide loader version section
+            if loader == "vanilla":
+                loader_version_label.pack_forget()
+                if loader_version_menu:
+                    loader_version_menu.pack_forget()
+                return
+            
+            # Show loader version section
+            loader_version_label.pack(padx=10, pady=(8, 3), anchor="w")
+            
+            # Destroy old menu if exists
+            if loader_version_menu:
+                loader_version_menu.pack_forget()
+            
+            try:
+                self.log(f"Fetching {loader.upper()} versions for MC {mc_version}...", source="LAUNCHER")
+                dialog.update_idletasks()
+                
+                if not mc_version:
+                    versions = ["latest"]
+                elif loader == "forge":
+                    versions = get_available_forge_versions(mc_version)
+                    if not versions:
+                        versions = ["latest"]
+                elif loader == "neoforge":
+                    versions = get_available_neoforge_versions(mc_version)
+                    if not versions:
+                        versions = ["latest"]
+                elif loader == "fabric":
+                    fabric_versions = get_available_fabric_versions(mc_version)
+                    versions = [v[0] for v in fabric_versions] if fabric_versions else ["latest"]
+                else:
+                    versions = ["latest"]
+                
+                # Create new menu
+                loader_version_var.set(versions[0])
+                loader_version_menu = OptionMenu(dialog, loader_version_var, *versions)
+                loader_version_menu.config(
+                    bg="#4d5c32",
+                    fg=self.text_color,
+                    activebackground=self.button_hover_color,
+                    activeforeground=self.text_color,
+                    relief="flat",
+                    highlightthickness=0,
+                )
+                loader_version_menu["menu"].config(bg="#4d5c32", fg=self.text_color)
+                loader_version_menu.pack(padx=10, pady=3, fill="x")
+                
+                self.log(f"Loaded {len(versions)} {loader.upper()} versions", source="LAUNCHER")
+            except Exception as e:
+                self.log(f"Error loading loader versions: {e}", source="LAUNCHER")
+                loader_version_var.set("latest")
+                loader_version_menu = OptionMenu(dialog, loader_version_var, "latest")
+                loader_version_menu.config(
+                    bg="#4d5c32",
+                    fg=self.text_color,
+                    activebackground=self.button_hover_color,
+                    activeforeground=self.text_color,
+                    relief="flat",
+                    highlightthickness=0,
+                )
+                loader_version_menu["menu"].config(bg="#4d5c32", fg=self.text_color)
+                loader_version_menu.pack(padx=10, pady=3, fill="x")
+
+        # Bind loader and MC version changes
+        loader_var.trace("w", lambda *_: update_loader_versions())
+        mc_ver_var.trace("w", lambda *_: update_loader_versions())
+
         def on_create():
             name = name_var.get().strip()
             if not name:
@@ -1061,6 +1781,17 @@ class MinecraftLauncherApp:
             (mp_dir / "config").mkdir(parents=True, exist_ok=True)
             (mp_dir / "resourcepacks").mkdir(parents=True, exist_ok=True)
 
+            # Save loader metadata
+            mc_version = mc_ver_var.get().strip()
+            loader = loader_var.get()
+            loader_version = loader_version_var.get() if loader != "vanilla" else ""
+            metadata = {
+                "loader": loader,
+                "loader_version": loader_version,
+                "minecraft_version": mc_version,
+            }
+            save_modpack_metadata(mp_dir, metadata)
+
             self._load_modpacks_into_list()
             for idx in range(self.modpack_listbox.size()):
                 if self.modpack_listbox.get(idx) == safe_name:
@@ -1070,7 +1801,24 @@ class MinecraftLauncherApp:
                     self._on_modpack_selected()
                     break
             dialog.destroy()
-            self.log(f"Created modpack '{safe_name}'.")
+            self.log(f"Created modpack '{safe_name}' (loader: {loader}, MC: {mc_version}).")
+            
+            # Auto-download vanilla version for this MC version
+            if mc_version:
+                self.log(f"Auto-downloading vanilla {mc_version}...", source="LAUNCHER")
+                threading.Thread(
+                    target=self._auto_download_vanilla_version,
+                    args=(mc_version,),
+                    daemon=True,
+                ).start()
+            
+            # Auto-download modloader if not vanilla
+            if loader != "vanilla" and mc_version:
+                threading.Thread(
+                    target=self._auto_download_modloader,
+                    args=(loader, mc_version, loader_version),
+                    daemon=True,
+                ).start()
 
         btn_frame = Frame(dialog, bg=self.panel_color)
         btn_frame.pack(padx=10, pady=10, fill="x")
@@ -1123,6 +1871,65 @@ class MinecraftLauncherApp:
         )
         entry.pack(padx=10, pady=3, fill="x")
 
+        # Load and display current loader settings
+        metadata = load_modpack_metadata(mp_dir)
+        current_loader = metadata.get("loader", "vanilla")
+        current_mc_version = metadata.get("minecraft_version", "")
+
+        Label(
+            dialog,
+            text="Loader:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 11),
+        ).pack(padx=10, pady=(10, 3), anchor="w")
+
+        loader_var = StringVar(value=current_loader)
+        loader_frame = Frame(dialog, bg=self.panel_color)
+        loader_frame.pack(padx=10, pady=3, fill="x")
+
+        self._mk_main_button(
+            loader_frame,
+            "Vanilla",
+            lambda: loader_var.set("vanilla"),
+        ).pack(side="left", padx=3)
+        self._mk_main_button(
+            loader_frame,
+            "Forge",
+            lambda: loader_var.set("forge"),
+        ).pack(side="left", padx=3)
+        self._mk_main_button(
+            loader_frame,
+            "Fabric",
+            lambda: loader_var.set("fabric"),
+        ).pack(side="left", padx=3)
+        self._mk_main_button(
+            loader_frame,
+            "NeoForge",
+            lambda: loader_var.set("neoforge"),
+        ).pack(side="left", padx=3)
+
+        Label(
+            dialog,
+            text="Minecraft Version (for Forge/Fabric/NeoForge):",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).pack(padx=10, pady=(8, 3), anchor="w")
+
+        mc_ver_var = StringVar(value=current_mc_version or "1.21.1")
+        mc_entry = Entry(
+            dialog,
+            textvariable=mc_ver_var,
+            bg="#1f2616",
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            highlightthickness=1,
+            highlightbackground="#101509",
+            highlightcolor=self.accent_color,
+        )
+        mc_entry.pack(padx=10, pady=3, fill="x")
+
         def open_folder(sub):
             target = mp_dir / sub
             target.mkdir(parents=True, exist_ok=True)
@@ -1155,15 +1962,6 @@ class MinecraftLauncherApp:
             folder_frame, "resourcepacks", lambda: open_folder("resourcepacks")
         ).pack(side="left", padx=3)
 
-        add_mod_frame = Frame(dialog, bg=self.panel_color)
-        add_mod_frame.pack(padx=10, pady=(5, 3), fill="x")
-
-        self._mk_main_button(
-            add_mod_frame,
-            "Add Mod (CF/Modrinth)",
-            lambda: self.add_mod_to_modpack_dialog(mp_dir),
-        ).pack(side="left", padx=3)
-
         def on_save():
             old_name = name
             new_name = name_var.get().strip()
@@ -1190,6 +1988,19 @@ class MinecraftLauncherApp:
                 if self.config.get("last_selected_modpack") == old_name:
                     self.config["last_selected_modpack"] = safe_name
                 self.selected_modpack.set(safe_name)
+                current_dir = new_dir
+            else:
+                current_dir = mp_dir
+
+            # Save loader metadata
+            new_loader = loader_var.get()
+            new_mc_version = mc_ver_var.get().strip()
+            metadata = {
+                "loader": new_loader,
+                "loader_version": "",
+                "minecraft_version": new_mc_version,
+            }
+            save_modpack_metadata(current_dir, metadata)
 
             save_config(self.config)
             self._load_modpacks_into_list()
@@ -1201,7 +2012,15 @@ class MinecraftLauncherApp:
                     self._on_modpack_selected()
                     break
             dialog.destroy()
-            self.log(f"Updated modpack '{self.selected_modpack.get()}'.")
+            self.log(f"Updated modpack '{self.selected_modpack.get()}' (loader: {new_loader}).")
+            
+            # Auto-download new modloader if changed to non-vanilla
+            if new_loader != "vanilla" and new_mc_version and new_loader != current_loader:
+                threading.Thread(
+                    target=self._auto_download_modloader,
+                    args=(new_loader, new_mc_version, ""),
+                    daemon=True,
+                ).start()
 
         btn_frame = Frame(dialog, bg=self.panel_color)
         btn_frame.pack(padx=10, pady=10, fill="x")
@@ -1340,10 +2159,38 @@ class MinecraftLauncherApp:
             ext = src.suffix.lower()
             self.log(f"Importing modpack '{name}' from {src.name}...", source="LAUNCHER")
 
+            # Import and get detected MC version, loader, and loader_version
+            api_key = self.config.get("curseforge_api_key", "")
             if ext == ".mrpack":
-                import_modrinth_modpack(src, dest_dir, self.log)
+                mc_version, loader, loader_version = import_modrinth_modpack(src, dest_dir, self.log)
             else:
-                import_curseforge_modpack(src, dest_dir)
+                mc_version, loader, loader_version = import_curseforge_modpack(src, dest_dir, self.log, api_key)
+
+            # Initialize modpack metadata
+            metadata = load_modpack_metadata(dest_dir)
+            metadata["loader"] = loader
+            metadata["loader_version"] = loader_version
+            if mc_version:
+                metadata["minecraft_version"] = mc_version
+                self.log(f"Stored MC version {mc_version} for modpack.", source="LAUNCHER")
+            if loader != "vanilla":
+                self.log(f"Stored {loader.upper()} loader (v{loader_version}) for modpack.", source="LAUNCHER")
+            save_modpack_metadata(dest_dir, metadata)
+
+            # Auto-download vanilla version if MC version was detected
+            if mc_version:
+                self.log(f"Auto-downloading vanilla {mc_version}...", source="LAUNCHER")
+                try:
+                    download_vanilla_version(mc_version, self.config, self.log)
+                    self._refresh_args_file_options()
+                    self.log(f"Downloaded vanilla {mc_version}.", source="LAUNCHER")
+                except Exception as e:
+                    self.log(f"Warning: Could not auto-download vanilla {mc_version}: {e}", source="LAUNCHER")
+                    # Don't fail the import if vanilla download fails
+            
+            # Auto-download modloader if detected
+            if loader != "vanilla" and mc_version:
+                self._auto_download_modloader(loader, mc_version, loader_version)
 
             self.log(f"Imported modpack '{name}'.", source="LAUNCHER")
             self._load_modpacks_into_list()
@@ -1362,272 +2209,6 @@ class MinecraftLauncherApp:
                 f"Failed to import modpack:\n{e}",
             )
             self.log("Failed to import modpack.", source="LAUNCHER")
-
-    # ----- Add single mod (CF / Modrinth) -----
-
-    def add_mod_to_modpack_dialog(self, mp_dir: Path):
-        dialog = Toplevel(self.root)
-        dialog.title("Add Mod to Modpack")
-        dialog.configure(bg=self.panel_color)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        Label(
-            dialog,
-            text="Source:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(10, 3), anchor="w")
-
-        source_var = StringVar(value="modrinth")
-        source_frame = Frame(dialog, bg=self.panel_color)
-        source_frame.pack(padx=10, pady=(0, 5), fill="x")
-
-        def set_source_modrinth():
-            source_var.set("modrinth")
-
-        def set_source_curseforge():
-            source_var.set("curseforge")
-
-        self._mk_main_button(
-            source_frame, "Modrinth", set_source_modrinth
-        ).pack(side="left", padx=3)
-        self._mk_main_button(
-            source_frame, "CurseForge", set_source_curseforge
-        ).pack(side="left", padx=3)
-
-        Label(
-            dialog,
-            text="Mod URL or ID:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(5, 3), anchor="w")
-
-        url_var = StringVar()
-        url_entry = Entry(
-            dialog,
-            textvariable=url_var,
-            bg="#1f2616",
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-            width=60,
-        )
-        url_entry.pack(padx=10, pady=3, fill="x")
-        url_entry.focus_set()
-
-        hint = (
-            "Modrinth: paste a project URL (e.g. https://modrinth.com/mod/sodium)\n"
-            "          or slug (e.g. 'sodium'). Latest version will be used.\n"
-            "CurseForge: paste a direct .jar file URL OR project slug/URL/ID.\n"
-            "Mods will be downloaded into this modpack's 'mods' folder."
-        )
-        Label(
-            dialog,
-            text=hint,
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 9),
-            justify="left",
-        ).pack(padx=10, pady=(0, 8), anchor="w")
-
-        def on_add():
-            source = source_var.get()
-            text = url_var.get().strip()
-            if not text:
-                messagebox.showwarning("Missing URL/ID", "Please enter a URL or ID.")
-                return
-            dialog.destroy()
-            threading.Thread(
-                target=self._do_add_mod_to_modpack,
-                args=(source, text, mp_dir),
-                daemon=True,
-            ).start()
-
-        btn_frame = Frame(dialog, bg=self.panel_color)
-        btn_frame.pack(padx=10, pady=10, fill="x")
-
-        self._mk_main_button(btn_frame, "Add", on_add).pack(
-            side="right", padx=5
-        )
-        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(
-            side="right", padx=5
-        )
-
-    def _do_add_mod_to_modpack(self, source: str, text: str, mp_dir: Path):
-        try:
-            mods_dir = mp_dir / "mods"
-            mods_dir.mkdir(parents=True, exist_ok=True)
-
-            if source == "modrinth":
-                self._add_mod_from_modrinth(text, mods_dir)
-            else:
-                self._add_mod_from_curseforge(text, mods_dir)
-
-        except Exception as e:
-            messagebox.showerror(
-                "Add mod error",
-                f"Failed to add mod:\n{e}",
-            )
-            self.log("Failed to add mod.", source="LAUNCHER")
-
-    def _add_mod_from_modrinth(self, text: str, mods_dir: Path):
-        import re
-
-        self.log(f"Resolving Modrinth project from '{text}'...", source="LAUNCHER")
-
-        m = re.search(r"modrinth\.com/mod/([^/]+)", text)
-        if not m:
-            m = re.search(r"modrinth\.com/project/([^/]+)", text)
-        if m:
-            project_id = m.group(1)
-        else:
-            project_id = text
-
-        url_project = f"https://api.modrinth.com/v2/project/{project_id}"
-        with urllib.request.urlopen(url_project) as resp:
-            project = json.loads(resp.read().decode("utf-8"))
-
-        project_id = project["id"]
-        slug = project.get("slug", project_id)
-        self.log(f"Modrinth project resolved: {slug} ({project_id})", source="LAUNCHER")
-
-        url_versions = f"https://api.modrinth.com/v2/project/{project_id}/version"
-        with urllib.request.urlopen(url_versions) as resp:
-            versions = json.loads(resp.read().decode("utf-8"))
-
-        if not versions:
-            raise RuntimeError("No versions found on Modrinth project.")
-
-        version = versions[0]
-        files = version.get("files", [])
-        if not files:
-            raise RuntimeError("No files in latest Modrinth version.")
-
-        file_info = files[0]
-        file_url = file_info["url"]
-        filename = file_info["filename"]
-
-        target = mods_dir / filename
-        self.log(f"Downloading Modrinth mod '{slug}' -> {target}", source="LAUNCHER")
-        download_to_file(file_url, target)
-        self.log(f"Added Modrinth mod '{slug}' as {filename}", source="LAUNCHER")
-
-    # ----- CurseForge API helpers -----
-
-    def _cf_api_request(self, path: str) -> dict:
-        api_key = CURSEFORGE_API_KEY.strip()
-        if not api_key:
-            raise RuntimeError("CURSEFORGE_API_KEY is empty. Set it at the top of the script.")
-
-        url = "https://api.curseforge.com" + path
-        req = urllib.request.Request(url)
-        req.add_header("Accept", "application/json")
-        req.add_header("x-api-key", api_key)
-
-        with urllib.request.urlopen(req) as resp:
-            data = resp.read().decode("utf-8")
-        return json.loads(data)
-
-    def _cf_resolve_project(self, text: str) -> int:
-        import re
-        import urllib.parse
-
-        text = text.strip()
-
-        if text.isdigit():
-            return int(text)
-
-        m = re.search(r"curseforge\.com/minecraft/mc-mods/([^/]+)", text)
-        if m:
-            slug = m.group(1)
-        else:
-            slug = text
-
-        params = f"?gameId=432&searchFilter={urllib.parse.quote(slug)}"
-        data = self._cf_api_request("/v1/mods/search" + params)
-        mods = data.get("data", [])
-        if not mods:
-            raise RuntimeError(f"No CurseForge mods found for slug '{slug}'.")
-
-        mod = mods[0]
-        mod_id = mod["id"]
-        name = mod.get("name", "")
-        self.log(f"CurseForge project resolved: {name} (id={mod_id})", source="LAUNCHER")
-        return mod_id
-
-    def _cf_pick_file_for_mod(self, mod_id: int, target_mc_version: str | None) -> dict:
-        data = self._cf_api_request(f"/v1/mods/{mod_id}/files")
-        files = data.get("data", [])
-        if not files:
-            raise RuntimeError(f"No files found for CurseForge mod id={mod_id}.")
-
-        if not target_mc_version:
-            return files[0]
-
-        matching = []
-        for f in files:
-            gv = f.get("gameVersions") or []
-            if target_mc_version in gv:
-                matching.append(f)
-
-        if matching:
-            return matching[0]
-        return files[0]
-
-    def _add_mod_from_curseforge(self, text: str, mods_dir: Path):
-        import os
-        import urllib.parse
-        import re
-
-        text = text.strip()
-        parsed = urllib.parse.urlparse(text)
-        path = parsed.path or ""
-        is_http_url = parsed.scheme in ("http", "https") and parsed.netloc != ""
-
-        if is_http_url and path.lower().endswith(".jar"):
-            self.log(f"Downloading CurseForge mod from direct URL '{text}'...", source="LAUNCHER")
-            name = os.path.basename(path) or "curseforge_mod.jar"
-            target = mods_dir / name
-            download_to_file(text, target)
-            self.log(f"Added CurseForge mod as {name}", source="LAUNCHER")
-            return
-
-        if not CURSEFORGE_API_KEY.strip():
-            raise RuntimeError(
-                "CURSEFORGE_API_KEY is empty. Set it at the top of the script or use a direct .jar URL."
-            )
-
-        if not is_http_url and text.isdigit():
-            mod_id = int(text)
-        else:
-            self.log(f"Resolving CurseForge mod via API from '{text}'...", source="LAUNCHER")
-            mod_id = self._cf_resolve_project(text)
-
-        target_mc_version = None
-        args_name = self.args_file_var.get()
-        m = re.search(r"java_args_(\d+\.\d+(?:\.\d+)?).txt", args_name)
-        if m:
-            target_mc_version = m.group(1)
-            self.log(
-                f"Target MC version inferred as {target_mc_version} from args file.",
-                source="LAUNCHER",
-            )
-
-        file_info = self._cf_pick_file_for_mod(mod_id, target_mc_version)
-        file_name = file_info.get("fileName") or "curseforge_mod.jar"
-        download_url = file_info.get("downloadUrl")
-        if not download_url:
-            raise RuntimeError("CurseForge file has no downloadUrl.")
-
-        target = mods_dir / file_name
-        self.log(f"Downloading CurseForge file id={file_info.get('id')} -> {target}", source="LAUNCHER")
-        download_to_file(download_url, target)
-        self.log(f"Added CurseForge mod as {file_name}", source="LAUNCHER")
 
     # ----- Install vanilla version -----
 
@@ -1712,6 +2293,40 @@ class MinecraftLauncherApp:
             )
             self.log("Failed to install vanilla version.", source="LAUNCHER")
 
+    def _auto_download_vanilla_version(self, version_id: str):
+        """Auto-download vanilla version without blocking UI or showing errors."""
+        try:
+            args_file = download_vanilla_version(version_id, self.config, self.log)
+            self.log(
+                f"Downloaded vanilla {version_id}. Args: USERDIR/vanilla/{args_file.name}",
+                source="LAUNCHER",
+            )
+            self._refresh_args_file_options()
+        except Exception as e:
+            self.log(f"Warning: Could not auto-download vanilla {version_id}: {e}", source="LAUNCHER")
+
+    def _auto_download_modloader(self, loader: str, mc_version: str, loader_version: str = ""):
+        """Auto-download modloader (Forge/Fabric/NeoForge) without blocking UI.
+        
+        Args:
+            loader: "forge", "fabric", or "neoforge"
+            mc_version: Minecraft version
+            loader_version: Specific loader version (empty = latest)
+        """
+        try:
+            self.log(f"Auto-downloading {loader.upper()} for MC {mc_version}...", source="LAUNCHER")
+            if loader == "forge":
+                installer_path = download_forge_installer(mc_version, self.log, loader_version)
+                self.log(f"Forge installer cached: {installer_path.name}", source="LAUNCHER")
+            elif loader == "neoforge":
+                installer_path = download_neoforge_installer(mc_version, self.log, loader_version)
+                self.log(f"NeoForge installer cached: {installer_path.name}", source="LAUNCHER")
+            elif loader == "fabric":
+                installer_path = download_fabric_installer(mc_version, self.log, loader_version)
+                self.log(f"Fabric installer cached: {installer_path.name}", source="LAUNCHER")
+        except Exception as e:
+            self.log(f"Warning: Could not auto-download {loader} for {mc_version}: {e}", source="LAUNCHER")
+
     # ----- Settings -----
 
     def choose_minecraft_dir(self):
@@ -1723,6 +2338,91 @@ class MinecraftLauncherApp:
         self.config["minecraft_dir"] = directory
         save_config(self.config)
         self.log(f"Minecraft directory set to: {directory}", source="LAUNCHER")
+
+    def settings_dialog(self):
+        """Open settings dialog for API keys and launcher configuration."""
+        dialog = Toplevel(self.root)
+        dialog.title("Launcher Settings")
+        dialog.configure(bg=self.panel_color)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.geometry("600x300")
+
+        # CurseForge API Key section
+        Label(
+            dialog,
+            text="CurseForge API Key (optional)",
+            bg=self.panel_color,
+            fg=self.accent_color,
+            font=("Helvetica", 12, "bold"),
+        ).pack(padx=10, pady=(15, 3), anchor="w")
+
+        hint_text = (
+            "Get a free API key from: https://console.curseforge.com/\n"
+            "Optional but recommended for better mod download reliability.\n"
+            "Your key is stored locally in launcher_config.json"
+        )
+        Label(
+            dialog,
+            text=hint_text,
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 9),
+            justify="left",
+        ).pack(padx=10, pady=(0, 5), anchor="w")
+
+        api_key_var = StringVar(value=self.config.get("curseforge_api_key", ""))
+        api_key_entry = Entry(
+            dialog,
+            textvariable=api_key_var,
+            bg="#1f2616",
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            highlightthickness=1,
+            highlightbackground="#101509",
+            highlightcolor=self.accent_color,
+            show="*",  # Hide the API key characters
+        )
+        api_key_entry.pack(padx=10, pady=5, fill="x")
+
+        # Info section
+        info_frame = Frame(dialog, bg=self.panel_color)
+        info_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        info_text = (
+            "Settings are automatically saved when you click OK.\n\n"
+            "The CurseForge API key is used when importing modpacks\n"
+            "to download mod files that aren't bundled in the archive.\n\n"
+            "Note: API keys are stored in plain text locally.\n"
+            "Keep your key secret - don't share launchers or configs."
+        )
+        Label(
+            info_frame,
+            text=info_text,
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 9),
+            justify="left",
+        ).pack(anchor="w", fill="both", expand=True)
+
+        # Buttons
+        btn_frame = Frame(dialog, bg=self.panel_color)
+        btn_frame.pack(padx=10, pady=10, fill="x")
+
+        def on_save():
+            api_key = api_key_var.get().strip()
+            self.config["curseforge_api_key"] = api_key
+            save_config(self.config)
+            if api_key:
+                self.log("CurseForge API key saved.", source="LAUNCHER")
+            else:
+                self.log("CurseForge API key cleared.", source="LAUNCHER")
+            dialog.destroy()
+
+        self._mk_main_button(btn_frame, "OK", on_save).pack(side="right", padx=5)
+        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(
+            side="right", padx=5
+        )
 
     # ----- Play logic -----
 
@@ -1777,6 +2477,11 @@ class MinecraftLauncherApp:
             self.log(f"Args file not found: {args_file}", source="LAUNCHER")
             return
 
+        # Load modpack loader metadata
+        metadata = load_modpack_metadata(mp_dir)
+        loader = metadata.get("loader", "vanilla")
+        mc_version = metadata.get("minecraft_version", "")
+
         try:
             self.log(f"Applying modpack '{name}'...", source="LAUNCHER")
             self.root.update_idletasks()
@@ -1797,14 +2502,100 @@ class MinecraftLauncherApp:
             os.makedirs(res_dst, exist_ok=True)
             copy_tree(str(res_src), str(res_dst))
 
-            self.log(
-                f"Modpack '{name}' applied. Launching Minecraft with USERDIR/vanilla/{args_name}...",
-                source="LAUNCHER",
-            )
-            self._launch_with_argfile(java_exe, args_file)
+            if loader != "vanilla":
+                self.log(f"Setting up {loader.upper()} loader...", source="LAUNCHER")
+                threading.Thread(
+                    target=self._setup_and_launch_with_loader,
+                    args=(name, loader, mc_version, java_exe, args_file, mc_dir),
+                    daemon=True,
+                ).start()
+            else:
+                self.log(
+                    f"Modpack '{name}' applied. Launching Minecraft with USERDIR/vanilla/{args_name}...",
+                    source="LAUNCHER",
+                )
+                self._launch_with_argfile(java_exe, args_file)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply modpack or launch: {e}")
             self.log("Error while applying modpack / launching.", source="LAUNCHER")
+
+    def _setup_and_launch_with_loader(self, name: str, loader: str, mc_version: str, java_exe: Path, args_file: Path, mc_dir: str):
+        """Setup Forge/Fabric/NeoForge and launch with modified arguments."""
+        try:
+            if not mc_version:
+                raise RuntimeError(f"Minecraft version not set for {loader} modpack.")
+
+            if loader == "forge":
+                installer_path = download_forge_installer(mc_version, self.log)
+                self.log(f"Installing Forge to {mc_dir}...", source="LAUNCHER")
+                # Run forge installer in install client mode
+                # Forge installer JAR can be run with --installClient
+                subprocess.run(
+                    [
+                        str(java_exe),
+                        "-jar",
+                        str(installer_path),
+                        "--installClient",
+                        mc_dir,
+                    ],
+                    cwd=str(INSTALL_DIR),
+                    capture_output=True,
+                    timeout=300,
+                )
+                self.log(f"Forge installed. Launching...", source="LAUNCHER")
+
+            elif loader == "neoforge":
+                installer_path = download_neoforge_installer(mc_version, self.log)
+                self.log(f"Installing NeoForge to {mc_dir}...", source="LAUNCHER")
+                # Run neoforge installer in install client mode (similar to Forge)
+                subprocess.run(
+                    [
+                        str(java_exe),
+                        "-jar",
+                        str(installer_path),
+                        "--installClient",
+                        mc_dir,
+                    ],
+                    cwd=str(INSTALL_DIR),
+                    capture_output=True,
+                    timeout=300,
+                )
+                self.log(f"NeoForge installed. Launching...", source="LAUNCHER")
+
+            elif loader == "fabric":
+                installer_path = download_fabric_installer(mc_version, self.log)
+                self.log(f"Installing Fabric to {mc_dir}...", source="LAUNCHER")
+                # Run fabric installer
+                subprocess.run(
+                    [
+                        str(java_exe),
+                        "-jar",
+                        str(installer_path),
+                        "client",
+                        "-dir",
+                        mc_dir,
+                        "-profile",
+                        "fabric",
+                        "-loader",
+                        "0.15.0",  # or latest
+                        "-game",
+                        mc_version,
+                    ],
+                    cwd=str(INSTALL_DIR),
+                    capture_output=True,
+                    timeout=300,
+                )
+                self.log(f"Fabric installed. Launching...", source="LAUNCHER")
+
+            # Launch using the modified args file or vanilla args
+            self._launch_with_argfile(java_exe, args_file)
+
+        except Exception as e:
+            messagebox.showerror(
+                "Loader setup error",
+                f"Failed to setup {loader}:\n{e}",
+            )
+            self.log(f"Failed to setup {loader}.", source="LAUNCHER")
 
     def _launch_with_argfile(self, java_exe: Path, args_file: Path):
         """Launch Java with @<args_file> from USERDIR and stream logs to console."""
