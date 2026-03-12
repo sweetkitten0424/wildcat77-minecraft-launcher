@@ -51,12 +51,14 @@ JAVA_RUNTIME_VERSION = "21.0.7"  # version we expect
 JAVA_RUNTIME_VERSION_FILE = "java_runtime_version.txt"
 
 # Vanilla args directory and pattern
-VANILLA_DIR = INSTALL_DIR / "vanilla"  # all a</old_code><new_code># Shared resources (download once, reused by all versions/instances)
-# NOTE: previously these lived under USERDIR/global/{libraries,assets}. We now store them at:
+VANILLA_DIR = INSTALL_DIR / "vanilla"  # all args files live here
+
+# Shared resources (download once, reused by all versions/instances)
+# Stored at:
 #   USERDIR/libraries
 #   USERDIR/assets
 GLOBAL_LIBRARIES_DIR = INSTALL_DIR / "libraries"
-GLOBAL_ASSETS_DIR = INSTALL_DIR /sets"
+GLOBAL_ASSETS_DIR = INSTALL_DIR / "assets"
 
 # Mojang endpoints
 VERSION_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -140,10 +142,147 @@ def clean_dir(path):
         if os.path.isdir(full):
             shutil.rmtree(full)
         else:
-         </old_code><new_code>def download_to_file(url: str, dest: Path):
+            os.remove(full)
+
+
+def download_to_file(url: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as resp, open(dest, "wb") as out_f:
         shutil.copyfileobj(resp, out_f)
+
+
+def merge_move_tree(src: Path, dst: Path):
+    if not src.exists():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+
+    for p in src.rglob("*"):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(src)
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            shutil.move(str(p), str(target))
+
+    for p in sorted(src.rglob("*"), reverse=True):
+        if p.is_dir():
+            try:
+                p.rmdir()
+            except OSError:
+                pass
+
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def migrate_legacy_args_files(logger=None):
+    if not VANILLA_DIR.exists():
+        return
+
+    libs_root = str(GLOBAL_LIBRARIES_DIR.resolve())
+    assets_root = str(GLOBAL_ASSETS_DIR.resolve())
+    libs_root_posix = GLOBAL_LIBRARIES_DIR.resolve().as_posix()
+    assets_root_posix = GLOBAL_ASSETS_DIR.resolve().as_posix()
+
+    for p in VANILLA_DIR.glob("java_args_*.txt"):
+        version_id = p.stem.replace("java_args_", "", 1)
+
+        legacy_version_root = VANILLA_DIR / version_id
+        legacy_libs = legacy_version_root / "libraries"
+        legacy_assets = legacy_version_root / "assets"
+        legacy_client = legacy_version_root / "versions" / version_id / f"{version_id}.jar"
+
+        new_client = (
+            GLOBAL_LIBRARIES_DIR
+            / "net"
+            / "minecraft"
+            / "client"
+            / version_id
+            / f"{version_id}.jar"
+        )
+
+        replacements = []
+        for src_path, dst_path in (
+            (str(legacy_libs.resolve()), libs_root),
+            (legacy_libs.resolve().as_posix(), libs_root_posix),
+            (str(legacy_assets.resolve()), assets_root),
+            (legacy_assets.resolve().as_posix(), assets_root_posix),
+            (str(legacy_client.resolve()), str(new_client.resolve())),
+            (legacy_client.resolve().as_posix(), new_client.resolve().as_posix()),
+        ):
+            replacements.append((src_path, dst_path))
+
+        try:
+            content = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        updated = content
+        for src_path, dst_path in replacements:
+            if src_path and dst_path:
+                updated = updated.replace(src_path, dst_path)
+
+        if updated != content:
+            try:
+                p.write_text(updated, encoding="utf-8")
+                if logger:
+                    logger(f"Updated args file paths: {p.name}")
+            except OSError:
+                pass
+
+
+def migrate_legacy_vanilla_version_resources(logger=None):
+    if not VANILLA_DIR.exists():
+        return
+
+    for version_root in sorted(VANILLA_DIR.iterdir()):
+        if not version_root.is_dir():
+            continue
+        version_id = version_root.name
+
+        legacy_libs = version_root / "libraries"
+        legacy_assets = version_root / "assets"
+        legacy_client = version_root / "versions" / version_id / f"{version_id}.jar"
+
+        new_client_dir = GLOBAL_LIBRARIES_DIR / "net" / "minecraft" / "client" / version_id
+        new_client = new_client_dir / f"{version_id}.jar"
+
+        if legacy_libs.exists():
+            if logger:
+                logger(f"Migrating legacy vanilla libraries for {version_id}...")
+            merge_move_tree(legacy_libs, GLOBAL_LIBRARIES_DIR)
+
+        if legacy_assets.exists():
+            if logger:
+                logger(f"Migrating legacy vanilla assets for {version_id}...")
+            merge_move_tree(legacy_assets, GLOBAL_ASSETS_DIR)
+
+        if legacy_client.exists() and not new_client.exists():
+            new_client_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(legacy_client), str(new_client))
+            except OSError:
+                try:
+                    shutil.copy2(legacy_client, new_client)
+                except OSError:
+                    pass
+
+        legacy_versions_dir = version_root / "versions"
+        if legacy_versions_dir.exists():
+            # best-effort cleanup; keep if other data remains
+            for p in sorted(legacy_versions_dir.rglob("*"), reverse=True):
+                if p.is_dir():
+                    try:
+                        p.rmdir()
+                    except OSError:
+                        pass
+            try:
+                legacy_versions_dir.rmdir()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------------------
@@ -158,39 +297,18 @@ def migrate_legacy_global_resources(logger=None):
     legacy_libs = legacy_root / "libraries"
     legacy_assets = legacy_root / "assets"
 
-    def merge_move(src: Path, dst: Path):
-        if not src.exists():
-            return
-        dst.mkdir(parents=True, exist_ok=True)
-        for p in src.rglob("*"):
-            if p.is_dir():
-                continue
-            rel = p.relative_to(src)
-            target = dst / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                shutil.move(str(p), str(target))
-        # clean up emptied dirs
-        for p in sorted(src.rglob("*"), reverse=True):
-            if p.is_dir():
-                try:
-                    p.rmdir()
-                except OSError:
-                    pass
-        try:
-            src.rmdir()
-        except OSError:
-            pass
-
     if logger:
         logger("Migrating legacy global resources (USERDIR/global) -> USERDIR/{libraries,assets}...")
 
-    merge_move(legacy_libs, GLOBAL_LIBRARIES_DIR)
-    merge_move(legacy_assets, GLOBAL_ASSETS_DIR)
+    merge_move_tree(legacy_libs, GLOBAL_LIBRARIES_DIR)
+    merge_move_tree(legacy_assets, GLOBAL_ASSETS_DIR)
 
     # Update existing args files that referenced USERDIR/global/{libraries,assets}
+    # and USERDIR/global/versions (legacy location we no longer use).
     legacy_libs_str = str(legacy_libs.resolve())
     legacy_assets_str = str(legacy_assets.resolve())
+    legacy_versions_str = str((legacy_root / "versions").resolve())
+
     new_libs_str = str(GLOBAL_LIBRARIES_DIR.resolve())
     new_assets_str = str(GLOBAL_ASSETS_DIR.resolve())
 
@@ -200,7 +318,12 @@ def migrate_legacy_global_resources(logger=None):
                 content = p.read_text(encoding="utf-8")
             except OSError:
                 continue
-            updated = content.replace(legacy_libs_str, new_libs_str).replace(legacy_assets_str, new_assets_str)
+            updated = (
+                content
+                .replace(legacy_libs_str, new_libs_str)
+                .replace(legacy_assets_str, new_assets_str)
+                .replace(legacy_versions_str, new_libs_str)
+            )
             if updated != content:
                 try:
                     p.write_text(updated, encoding="utf-8")
@@ -542,12 +665,9 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
     with urllib.request.urlopen(version_url) as resp:
         version_data = json.loads(resp.read().decode("utf-8"))
 
-    # Per-version storage for version json + client jar, but shared libs/assets.
+    # Per-version storage for version json, but shared libs/assets.
     version_root = VANILLA_DIR / version_id
-    versions_dir = version_root / "versions" / version_id
-
     version_root.mkdir(parents=True, exist_ok=True)
-    versions_dir.mkdir(parents=True, exist_ok=True)
 
     GLOBAL_LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
     GLOBAL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -555,11 +675,26 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
     version_json_path = version_root / f"{version_id}.json"
     version_json_path.write_text(json.dumps(version_data, indent=2), encoding="utf-8")
 
+    # Store the vanilla client jar in the shared libraries folder in a Maven-like layout:
+    #   USERDIR/libraries/net/minecraft/client/<mcVersion>/<mcVersion>.jar
+    client_dir = GLOBAL_LIBRARIES_DIR / "net" / "minecraft" / "client" / version_id
+    client_dir.mkdir(parents=True, exist_ok=True)
+
     client_download = version_data["downloads"]["client"]
     client_url = client_download["url"]
-    client_jar_path = versions_dir / f"{version_id}.jar"
-    logger(f"Downloading client JAR for {version_id}...")
-    download_to_file(client_url, client_jar_path)
+    client_jar_path = client_dir / f"{version_id}.jar"
+
+    # Migrate legacy per-version client jar if present.
+    legacy_client_jar = version_root / "versions" / version_id / f"{version_id}.jar"
+    if not client_jar_path.exists() and legacy_client_jar.exists():
+        try:
+            shutil.copy2(legacy_client_jar, client_jar_path)
+        except OSError:
+            pass
+
+    if not client_jar_path.exists():
+        logger(f"Downloading client JAR for {version_id}...")
+        download_to_file(client_url, client_jar_path)
 
     libraries = version_data.get("libraries", [])
     total_libs = len(libraries)
@@ -613,9 +748,7 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
     args_file = generate_java_args_from_version_json(
         version_id,
         version_data,
-        version_root,
         GLOBAL_LIBRARIES_DIR,
-        versions_dir,
         GLOBAL_ASSETS_DIR,
         config,
     )
@@ -627,13 +760,16 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
 def generate_java_args_from_version_json(
     version_id: str,
     version_data: dict,
-    version_root: Path,
     libraries_dir: Path,
-    versions_dir: Path,
     assets_dir: Path,
     config: dict,
 ) -> Path:
-    """Build a java_args_<version>.txt based on Mojang's version JSON."""
+    """Build a java_args_<version>.txt based on Mojang's version JSON.
+
+    Libraries are expected to be stored in a Maven-like directory layout.
+    The vanilla client jar is stored at:
+      USERDIR/libraries/net/minecraft/client/<mcVersion>/<mcVersion>.jar
+    """
     jvm_args = []
     game_args = []
 
@@ -652,14 +788,29 @@ def generate_java_args_from_version_json(
         if legacy_args:
             game_args.extend(legacy_args.split())
 
+    # Build classpath from the Mojang version manifest so we only include the
+    # libraries required for this specific version.
     cp_entries = []
-    for root, _, files in os.walk(libraries_dir):
-        for f in files:
-            if f.endswith(".jar"):
-                cp_entries.append(str(Path(root) / f))
+    seen = set()
 
-    client_jar = versions_dir / f"{version_id}.jar"
-    cp_entries.append(str(client_jar))
+    for lib in version_data.get("libraries", []):
+        downloads = lib.get("downloads", {})
+        artifact = downloads.get("artifact")
+        if not artifact:
+            continue
+        rel_path = artifact.get("path")
+        if not rel_path:
+            continue
+        jar_path = str(libraries_dir / Path(rel_path))
+        if jar_path in seen:
+            continue
+        seen.add(jar_path)
+        cp_entries.append(jar_path)
+
+    client_jar = libraries_dir / "net" / "minecraft" / "client" / version_id / f"{version_id}.jar"
+    client_jar_str = str(client_jar)
+    if client_jar.exists() and client_jar_str not in seen:
+        cp_entries.append(client_jar_str)
 
     classpath = ";".join(cp_entries) if sys.platform.startswith("win") else ":".join(cp_entries)
 
@@ -903,9 +1054,11 @@ class MinecraftLauncherApp:
     # ----- background tasks -----
 
     def _background_startup_tasks(self):
-        migrate_legacy_global_resources(self.log)
         GLOBAL_LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
         GLOBAL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        migrate_legacy_global_resources(self.log)
+        migrate_legacy_vanilla_version_resources(self.log)
+        migrate_legacy_args_files(self.log)
         ensure_java_runtime(self.config, self.log)
         self.log("Ready.")
 
