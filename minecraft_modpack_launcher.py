@@ -7,6 +7,7 @@ import threading
 import urllib.request
 import urllib.error
 import urllib.parse
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -149,6 +150,112 @@ def download_to_file(url: str, dest: Path):
 
 
 # --------------------------------------------------------------------------------------
+# Instance metadata (instance.json)
+# --------------------------------------------------------------------------------------
+
+def instance_json_path_for_modpack(mp_dir: Path) -> Path:
+    return mp_dir / "instance.json"
+
+
+def load_instance_json(mp_dir: Path) -> Optional[dict]:
+    path = instance_json_path_for_modpack(mp_dir)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_instance_json(mp_dir: Path, data: dict):
+    path = instance_json_path_for_modpack(mp_dir)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def get_instance_minecraft_version(instance: Optional[dict]) -> Optional[str]:
+    if not instance:
+        return None
+
+    launcher = instance.get("launcher") or {}
+
+    # Prefer CurseForge file data when present
+    curse_file = launcher.get("curseForgeFile") or {}
+    for v in (curse_file.get("gameVersions") or []):
+        if isinstance(v, str) and v and v[0].isdigit():
+            return v
+
+    # Fall back to loaderVersion rawVersion like "1.20.1-47.3.11"
+    lv = launcher.get("loaderVersion") or {}
+    raw = lv.get("rawVersion")
+    if isinstance(raw, str) and raw:
+        return raw.split("-")[0]
+
+    return None
+
+
+def normalize_loader_name(loader: str) -> str:
+    loader = (loader or "").strip().lower()
+    if loader in {"minecraftforge", "forge"}:
+        return "forge"
+    if loader in {"neoforge", "neo"}:
+        return "neoforge"
+    if loader in {"fabric"}:
+        return "fabric"
+    if loader in {"quilt"}:
+        return "quilt"
+    return loader
+
+
+def get_instance_loader(instance: Optional[dict]) -> Optional[str]:
+    if not instance:
+        return None
+    lv = ((instance.get("launcher") or {}).get("loaderVersion") or {})
+    t = lv.get("type")
+    if isinstance(t, str) and t:
+        return normalize_loader_name(t)
+    return None
+
+
+def infer_minecraft_version_from_args_filename(args_file_name: str) -> Optional[str]:
+    import re
+
+    m = re.search(r"java_args_(\d+\.\d+(?:\.\d+)?).txt", args_file_name or "")
+    if not m:
+        return None
+    return m.group(1)
+
+
+def create_default_instance_json(mp_dir: Path, name: str) -> dict:
+    return {
+        "uuid": str(uuid.uuid4()),
+        "launcher": {
+            "name": name,
+            "pack": name,
+            "description": "",
+            "packId": 0,
+            "externalPackId": 0,
+            "version": "1.0.0",
+            "enableCurseForgeIntegration": False,
+            "enableEditingMods": True,
+            "loaderVersion": {
+                "version": "",
+                "rawVersion": "",
+                "recommended": False,
+                "type": "Forge",
+                "downloadables": {},
+            },
+            "requiredMemory": 0,
+            "requiredPermGen": 0,
+            "maximumMemory": 4096,
+            "quickPlay": {},
+            "isDev": False,
+            "isPlayable": True,
+            "assetsMapToResources": False,
+            "checkForUpdates": True,
+            "overridePaths": [],
+            "mods": [],
+        },
+    }
+
+
+# --------------------------------------------------------------------------------------
 # Java runtime management
 # --------------------------------------------------------------------------------------
 
@@ -263,8 +370,13 @@ def ensure_java_runtime(config, logger):
 # CurseForge / Modrinth import helpers (modpacks)
 # --------------------------------------------------------------------------------------
 
-def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path):
-    """Import a CurseForge modpack zip: extract overrides/ into the modpack."""
+def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path) -> Optional[dict]:
+    """Import a CurseForge modpack zip: extract overrides/ into the modpack.
+
+    Returns the parsed manifest.json dict if present.
+    """
+    manifest = None
+
     with zipfile.ZipFile(zip_path, "r") as zf:
         namelist = zf.namelist()
 
@@ -276,8 +388,7 @@ def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path):
 
         if manifest_name:
             with zf.open(manifest_name) as mf:
-                _manifest = json.loads(mf.read().decode("utf-8"))
-            # manifest currently unused
+                manifest = json.loads(mf.read().decode("utf-8"))
 
         overrides_prefix = "overrides/"
         for name in namelist:
@@ -287,6 +398,8 @@ def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(name) as src, open(target, "wb") as out_f:
                     shutil.copyfileobj(src, out_f)
+
+    return manifest
 
 
 def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
@@ -996,6 +1109,11 @@ class MinecraftLauncherApp:
         config_dir = mp_dir / "config"
         resource_dir = mp_dir / "resourcepacks"
 
+        instance = load_instance_json(mp_dir)
+        if instance is None:
+            instance = create_default_instance_json(mp_dir, modpack_name)
+            save_instance_json(mp_dir, instance)
+
         mods_count = (
             sum(1 for _ in mods_dir.rglob("*") if _.is_file())
             if mods_dir.exists()
@@ -1015,8 +1133,14 @@ class MinecraftLauncherApp:
         java_exec = get_java_executable()
         args_file = self.args_file_var.get()
 
+        inst_mc = get_instance_minecraft_version(instance) or "<unknown>"
+        inst_loader = get_instance_loader(instance) or "<unknown>"
+
         info = [
             f"Folder: {mp_dir}",
+            "",
+            f"Minecraft: {inst_mc}",
+            f"Loader: {inst_loader}",
             "",
             f"Mods: {mods_count}",
             f"Config files: {config_count}",
@@ -1025,7 +1149,7 @@ class MinecraftLauncherApp:
             f"Java: {java_exec} (expected {JAVA_RUNTIME_VERSION})",
             f"Args file: USERDIR/vanilla/{args_file}",
             "",
-            "Tip: Drop files into this modpack's mods/config/resourcepacks folders.",
+            "Tip: Use Edit -> Instance Settings to set Minecraft version/loader.",
         ]
         self.detail_title.config(text=modpack_name)
         self.detail_info.config(text="\n".join(info))
@@ -1080,6 +1204,8 @@ class MinecraftLauncherApp:
             (mp_dir / "mods").mkdir(parents=True, exist_ok=True)
             (mp_dir / "config").mkdir(parents=True, exist_ok=True)
             (mp_dir / "resourcepacks").mkdir(parents=True, exist_ok=True)
+
+            save_instance_json(mp_dir, create_default_instance_json(mp_dir, safe_name))
 
             self._load_modpacks_into_list()
             for idx in range(self.modpack_listbox.size()):
@@ -1184,6 +1310,143 @@ class MinecraftLauncherApp:
             lambda: self.add_mod_to_modpack_dialog(mp_dir),
         ).pack(side="left", padx=3)
 
+        # Instance settings
+        instance = load_instance_json(mp_dir)
+        if instance is None:
+            instance = create_default_instance_json(mp_dir, name)
+            save_instance_json(mp_dir, instance)
+
+        inst_loader = (get_instance_loader(instance) or "forge").lower()
+        inst_mc = get_instance_minecraft_version(instance) or ""
+        inst_max_mem = str(((instance.get("launcher") or {}).get("maximumMemory") or 4096))
+
+        Label(
+            dialog,
+            text="Instance Settings (used for Modrinth/CurseForge filtering):",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 11),
+        ).pack(padx=10, pady=(10, 3), anchor="w")
+
+        settings_frame = Frame(dialog, bg=self.panel_color)
+        settings_frame.pack(padx=10, pady=3, fill="x")
+
+        Label(
+            settings_frame,
+            text="Minecraft version:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).grid(row=0, column=0, sticky="w")
+
+        mc_var = StringVar(value=inst_mc)
+        mc_entry = Entry(
+            settings_frame,
+            textvariable=mc_var,
+            bg="#1f2616",
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            highlightthickness=1,
+            highlightbackground="#101509",
+            highlightcolor=self.accent_color,
+            width=18,
+        )
+        mc_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
+
+        Label(
+            settings_frame,
+            text="Loader:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).grid(row=0, column=2, sticky="w")
+
+        loader_var = StringVar(value=inst_loader)
+        loader_menu = OptionMenu(settings_frame, loader_var, "forge", "fabric", "quilt", "neoforge")
+        loader_menu.config(
+            bg="#4d5c32",
+            fg=self.text_color,
+            activebackground=self.button_hover_color,
+            activeforeground=self.text_color,
+            relief="flat",
+            highlightthickness=0,
+        )
+        loader_menu["menu"].config(bg="#4d5c32", fg=self.text_color)
+        loader_menu.grid(row=0, column=3, sticky="w", padx=(6, 12))
+
+        Label(
+            settings_frame,
+            text="Max memory (MB):",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).grid(row=0, column=4, sticky="w")
+
+        mem_var = StringVar(value=inst_max_mem)
+        mem_entry = Entry(
+            settings_frame,
+            textvariable=mem_var,
+            bg="#1f2616",
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            highlightthickness=1,
+            highlightbackground="#101509",
+            highlightcolor=self.accent_color,
+            width=10,
+        )
+        mem_entry.grid(row=0, column=5, sticky="w", padx=(6, 0))
+
+        def save_instance_settings():
+            inst = load_instance_json(mp_dir) or create_default_instance_json(mp_dir, name)
+            launcher = inst.get("launcher") or {}
+            lv = launcher.get("loaderVersion") or {}
+
+            mc = mc_var.get().strip()
+            loader = normalize_loader_name(loader_var.get())
+            max_mem_raw = mem_var.get().strip()
+
+            # loaderVersion.type uses capitalized loader name, rawVersion keeps "<mc>-<loaderver>".
+            if loader == "forge":
+                lv["type"] = "Forge"
+            elif loader == "neoforge":
+                lv["type"] = "NeoForge"
+            elif loader == "fabric":
+                lv["type"] = "Fabric"
+            elif loader == "quilt":
+                lv["type"] = "Quilt"
+            else:
+                lv["type"] = loader
+
+            if mc:
+                raw = lv.get("rawVersion")
+                if isinstance(raw, str) and raw:
+                    # preserve "-<loaderver>" if present
+                    parts = raw.split("-", 1)
+                    if len(parts) == 2:
+                        lv["rawVersion"] = f"{mc}-{parts[1]}"
+                    else:
+                        lv["rawVersion"] = mc
+                else:
+                    lv["rawVersion"] = mc
+
+            launcher["loaderVersion"] = lv
+
+            try:
+                launcher["maximumMemory"] = int(max_mem_raw) if max_mem_raw else launcher.get("maximumMemory", 4096)
+            except ValueError:
+                launcher["maximumMemory"] = launcher.get("maximumMemory", 4096)
+
+            inst["launcher"] = launcher
+            save_instance_json(mp_dir, inst)
+            self._update_detail_panel(self.selected_modpack.get())
+            self.log("Saved instance settings (instance.json).", source="LAUNCHER")
+
+        self._mk_main_button(
+            add_mod_frame,
+            "Save Instance Settings",
+            save_instance_settings,
+        ).pack(side="left", padx=8)
+
         def on_save():
             old_name = name
             new_name = name_var.get().strip()
@@ -1198,6 +1461,7 @@ class MinecraftLauncherApp:
                 )
                 return
 
+            effective_mp_dir = mp_dir
             if safe_name != old_name:
                 new_dir = Path(MODPACKS_DIR) / safe_name
                 if new_dir.exists():
@@ -1207,9 +1471,17 @@ class MinecraftLauncherApp:
                     )
                     return
                 mp_dir.rename(new_dir)
+                effective_mp_dir = new_dir
                 if self.config.get("last_selected_modpack") == old_name:
                     self.config["last_selected_modpack"] = safe_name
                 self.selected_modpack.set(safe_name)
+
+            # Ensure instance.json exists
+            if load_instance_json(effective_mp_dir) is None:
+                save_instance_json(
+                    effective_mp_dir,
+                    create_default_instance_json(effective_mp_dir, self.selected_modpack.get()),
+                )
 
             save_config(self.config)
             self._load_modpacks_into_list()
@@ -1362,8 +1634,48 @@ class MinecraftLauncherApp:
 
             if ext == ".mrpack":
                 import_modrinth_modpack(src, dest_dir, self.log)
+                # No standardized instance metadata in .mrpack we rely on here
+                if load_instance_json(dest_dir) is None:
+                    save_instance_json(dest_dir, create_default_instance_json(dest_dir, name))
             else:
-                import_curseforge_modpack(src, dest_dir)
+                manifest = import_curseforge_modpack(src, dest_dir)
+                if manifest is not None:
+                    inst = create_default_instance_json(dest_dir, name)
+                    launcher = inst.get("launcher") or {}
+                    launcher["enableCurseForgeIntegration"] = True
+
+                    # CurseForge manifest: minecraft.modLoaders[0].id like "forge-47.3.11"
+                    mc = manifest.get("minecraft") or {}
+                    mod_loaders = mc.get("modLoaders") or []
+                    if mod_loaders:
+                        ml = mod_loaders[0] or {}
+                        ml_id = ml.get("id")
+                        if isinstance(ml_id, str) and ml_id:
+                            if ml_id.startswith("forge-"):
+                                launcher.setdefault("loaderVersion", {})
+                                launcher["loaderVersion"]["type"] = "Forge"
+                                launcher["loaderVersion"]["version"] = ml_id.split("-", 1)[1]
+                                gv = mc.get("version")
+                                if isinstance(gv, str) and gv:
+                                    launcher["loaderVersion"]["rawVersion"] = f"{gv}-{launcher['loaderVersion']['version']}"
+                            elif ml_id.startswith("fabric-"):
+                                launcher.setdefault("loaderVersion", {})
+                                launcher["loaderVersion"]["type"] = "Fabric"
+                                launcher["loaderVersion"]["version"] = ml_id.split("-", 1)[1]
+                                gv = mc.get("version")
+                                if isinstance(gv, str) and gv:
+                                    launcher["loaderVersion"]["rawVersion"] = gv
+
+                    cf_project = manifest.get("manifest") or {}
+                    if cf_project:
+                        launcher["externalPackId"] = cf_project.get("projectID", 0) or 0
+                        launcher["version"] = cf_project.get("version", launcher.get("version", "1.0.0"))
+
+                    inst["launcher"] = launcher
+                    save_instance_json(dest_dir, inst)
+                else:
+                    if load_instance_json(dest_dir) is None:
+                        save_instance_json(dest_dir, create_default_instance_json(dest_dir, name))
 
             self.log(f"Imported modpack '{name}'.", source="LAUNCHER")
             self._load_modpacks_into_list()
@@ -1483,10 +1795,21 @@ class MinecraftLauncherApp:
             mods_dir = mp_dir / "mods"
             mods_dir.mkdir(parents=True, exist_ok=True)
 
+            instance = load_instance_json(mp_dir)
+            if instance is None:
+                instance = create_default_instance_json(mp_dir, mp_dir.name)
+                save_instance_json(mp_dir, instance)
+
+            target_mc_version = get_instance_minecraft_version(instance)
+            if not target_mc_version:
+                target_mc_version = infer_minecraft_version_from_args_filename(self.args_file_var.get())
+
+            target_loader = get_instance_loader(instance)
+
             if source == "modrinth":
-                self._add_mod_from_modrinth(text, mods_dir)
+                self._add_mod_from_modrinth(text, mods_dir, target_mc_version, target_loader)
             else:
-                self._add_mod_from_curseforge(text, mods_dir)
+                self._add_mod_from_curseforge(text, mods_dir, target_mc_version, target_loader)
 
         except Exception as e:
             messagebox.showerror(
@@ -1495,7 +1818,13 @@ class MinecraftLauncherApp:
             )
             self.log("Failed to add mod.", source="LAUNCHER")
 
-    def _add_mod_from_modrinth(self, text: str, mods_dir: Path):
+    def _add_mod_from_modrinth(
+        self,
+        text: str,
+        mods_dir: Path,
+        target_mc_version: Optional[str],
+        target_loader: Optional[str],
+    ):
         import re
 
         self.log(f"Resolving Modrinth project from '{text}'...", source="LAUNCHER")
@@ -1516,9 +1845,30 @@ class MinecraftLauncherApp:
         slug = project.get("slug", project_id)
         self.log(f"Modrinth project resolved: {slug} ({project_id})", source="LAUNCHER")
 
-        url_versions = f"https://api.modrinth.com/v2/project/{project_id}/version"
-        with urllib.request.urlopen(url_versions) as resp:
+        versions_url = f"https://api.modrinth.com/v2/project/{project_id}/version"
+
+        params = {}
+        if target_mc_version:
+            params["game_versions"] = json.dumps([target_mc_version])
+        if target_loader:
+            params["loaders"] = json.dumps([normalize_loader_name(target_loader)])
+
+        if params:
+            versions_url = versions_url + "?" + urllib.parse.urlencode(params)
+            self.log(
+                f"Filtering Modrinth versions: mc={target_mc_version or '*'} loader={target_loader or '*'}",
+                source="LAUNCHER",
+            )
+
+        with urllib.request.urlopen(versions_url) as resp:
             versions = json.loads(resp.read().decode("utf-8"))
+
+        if not versions:
+            # If filters were too strict, retry without filters
+            if params:
+                self.log("No matching Modrinth versions found; retrying without filters...", source="LAUNCHER")
+                with urllib.request.urlopen(f"https://api.modrinth.com/v2/project/{project_id}/version") as resp:
+                    versions = json.loads(resp.read().decode("utf-8"))
 
         if not versions:
             raise RuntimeError("No versions found on Modrinth project.")
@@ -1526,9 +1876,16 @@ class MinecraftLauncherApp:
         version = versions[0]
         files = version.get("files", [])
         if not files:
-            raise RuntimeError("No files in latest Modrinth version.")
+            raise RuntimeError("No files in selected Modrinth version.")
 
-        file_info = files[0]
+        file_info = None
+        for f in files:
+            if f.get("primary"):
+                file_info = f
+                break
+        if file_info is None:
+            file_info = files[0]
+
         file_url = file_info["url"]
         filename = file_info["filename"]
 
@@ -1580,26 +1937,60 @@ class MinecraftLauncherApp:
         self.log(f"CurseForge project resolved: {name} (id={mod_id})", source="LAUNCHER")
         return mod_id
 
-    def _cf_pick_file_for_mod(self, mod_id: int, target_mc_version: str | None) -> dict:
+    def _cf_pick_file_for_mod(
+        self,
+        mod_id: int,
+        target_mc_version: Optional[str],
+        target_loader: Optional[str],
+    ) -> dict:
         data = self._cf_api_request(f"/v1/mods/{mod_id}/files")
         files = data.get("data", [])
         if not files:
             raise RuntimeError(f"No files found for CurseForge mod id={mod_id}.")
 
-        if not target_mc_version:
+        if not target_mc_version and not target_loader:
             return files[0]
+
+        loader_token = None
+        if target_loader:
+            norm = normalize_loader_name(target_loader)
+            if norm == "forge":
+                loader_token = "Forge"
+            elif norm == "neoforge":
+                loader_token = "NeoForge"
+            elif norm == "fabric":
+                loader_token = "Fabric"
+            elif norm == "quilt":
+                loader_token = "Quilt"
 
         matching = []
         for f in files:
             gv = f.get("gameVersions") or []
-            if target_mc_version in gv:
-                matching.append(f)
+            if target_mc_version and target_mc_version not in gv:
+                continue
+            if loader_token and loader_token not in gv:
+                continue
+            matching.append(f)
 
         if matching:
             return matching[0]
+
+        # Fall back: only require MC version
+        if target_mc_version:
+            for f in files:
+                gv = f.get("gameVersions") or []
+                if target_mc_version in gv:
+                    return f
+
         return files[0]
 
-    def _add_mod_from_curseforge(self, text: str, mods_dir: Path):
+    def _add_mod_from_curseforge(
+        self,
+        text: str,
+        mods_dir: Path,
+        target_mc_version: Optional[str],
+        target_loader: Optional[str],
+    ):
         import os
         import urllib.parse
         import re
@@ -1628,17 +2019,18 @@ class MinecraftLauncherApp:
             self.log(f"Resolving CurseForge mod via API from '{text}'...", source="LAUNCHER")
             mod_id = self._cf_resolve_project(text)
 
-        target_mc_version = None
-        args_name = self.args_file_var.get()
-        m = re.search(r"java_args_(\d+\.\d+(?:\.\d+)?).txt", args_name)
-        if m:
-            target_mc_version = m.group(1)
+        if target_mc_version:
             self.log(
-                f"Target MC version inferred as {target_mc_version} from args file.",
+                f"Target MC version from instance/args: {target_mc_version}",
+                source="LAUNCHER",
+            )
+        if target_loader:
+            self.log(
+                f"Target loader from instance: {normalize_loader_name(target_loader)}",
                 source="LAUNCHER",
             )
 
-        file_info = self._cf_pick_file_for_mod(mod_id, target_mc_version)
+        file_info = self._cf_pick_file_for_mod(mod_id, target_mc_version, target_loader)
         file_name = file_info.get("fileName") or "curseforge_mod.jar"
         download_url = file_info.get("downloadUrl")
         if not download_url:
