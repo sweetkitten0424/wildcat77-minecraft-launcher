@@ -51,12 +51,12 @@ JAVA_RUNTIME_VERSION = "21.0.7"  # version we expect
 JAVA_RUNTIME_VERSION_FILE = "java_runtime_version.txt"
 
 # Vanilla args directory and pattern
-VANILLA_DIR = INSTALL_DIR / "vanilla"  # all args files live here
-
-# Global shared resources (download once, reused by all versions/instances)
-GLOBAL_DIR = INSTALL_DIR / "global"
-GLOBAL_LIBRARIES_DIR = GLOBAL_DIR / "libraries"
-GLOBAL_ASSETS_DIR = GLOBAL_DIR / "assets"
+VANILLA_DIR = INSTALL_DIR / "vanilla"  # all a</old_code><new_code># Shared resources (download once, reused by all versions/instances)
+# NOTE: previously these lived under USERDIR/global/{libraries,assets}. We now store them at:
+#   USERDIR/libraries
+#   USERDIR/assets
+GLOBAL_LIBRARIES_DIR = INSTALL_DIR / "libraries"
+GLOBAL_ASSETS_DIR = INSTALL_DIR /sets"
 
 # Mojang endpoints
 VERSION_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -140,13 +140,78 @@ def clean_dir(path):
         if os.path.isdir(full):
             shutil.rmtree(full)
         else:
-            os.remove(full)
-
-
-def download_to_file(url: str, dest: Path):
+         </old_code><new_code>def download_to_file(url: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as resp, open(dest, "wb") as out_f:
         shutil.copyfileobj(resp, out_f)
+
+
+# --------------------------------------------------------------------------------------
+# Shared resources migration (remove legacy USERDIR/global)
+# --------------------------------------------------------------------------------------
+
+def migrate_legacy_global_resources(logger=None):
+    legacy_root = INSTALL_DIR / "global"
+    if not legacy_root.exists():
+        return
+
+    legacy_libs = legacy_root / "libraries"
+    legacy_assets = legacy_root / "assets"
+
+    def merge_move(src: Path, dst: Path):
+        if not src.exists():
+            return
+        dst.mkdir(parents=True, exist_ok=True)
+        for p in src.rglob("*"):
+            if p.is_dir():
+                continue
+            rel = p.relative_to(src)
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.move(str(p), str(target))
+        # clean up emptied dirs
+        for p in sorted(src.rglob("*"), reverse=True):
+            if p.is_dir():
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
+        try:
+            src.rmdir()
+        except OSError:
+            pass
+
+    if logger:
+        logger("Migrating legacy global resources (USERDIR/global) -> USERDIR/{libraries,assets}...")
+
+    merge_move(legacy_libs, GLOBAL_LIBRARIES_DIR)
+    merge_move(legacy_assets, GLOBAL_ASSETS_DIR)
+
+    # Update existing args files that referenced USERDIR/global/{libraries,assets}
+    legacy_libs_str = str(legacy_libs.resolve())
+    legacy_assets_str = str(legacy_assets.resolve())
+    new_libs_str = str(GLOBAL_LIBRARIES_DIR.resolve())
+    new_assets_str = str(GLOBAL_ASSETS_DIR.resolve())
+
+    if VANILLA_DIR.exists():
+        for p in VANILLA_DIR.glob("java_args_*.txt"):
+            try:
+                content = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            updated = content.replace(legacy_libs_str, new_libs_str).replace(legacy_assets_str, new_assets_str)
+            if updated != content:
+                try:
+                    p.write_text(updated, encoding="utf-8")
+                except OSError:
+                    pass
+
+    # Remove legacy_root if empty
+    try:
+        legacy_root.rmdir()
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------------------
@@ -464,7 +529,7 @@ def find_version_in_manifest(manifest, version_id: str):
 def download_vanilla_version(version_id: str, config, logger) -> Path:
     """Download vanilla client + libs + assets; generate java_args_<version>.txt.
 
-    Uses global shared libraries/assets folders so all versions can reuse them.
+    Uses shared libraries/assets folders so all versions can reuse them.
     """
     logger(f"Fetching manifest for version {version_id}...")
     manifest = fetch_version_manifest()
@@ -838,6 +903,9 @@ class MinecraftLauncherApp:
     # ----- background tasks -----
 
     def _background_startup_tasks(self):
+        migrate_legacy_global_resources(self.log)
+        GLOBAL_LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
+        GLOBAL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         ensure_java_runtime(self.config, self.log)
         self.log("Ready.")
 
