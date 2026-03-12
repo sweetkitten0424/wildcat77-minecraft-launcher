@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -290,21 +291,64 @@ def migrate_legacy_vanilla_version_resources(logger=None):
 # --------------------------------------------------------------------------------------
 
 def migrate_legacy_global_resources(logger=None):
+    """Migrate the legacy USERDIR/global folder.
+
+    We no longer use USERDIR/global; shared resources now live at:
+      USERDIR/libraries
+      USERDIR/assets
+
+    This migrates what we can, then removes USERDIR/global.
+    """
     legacy_root = INSTALL_DIR / "global"
     if not legacy_root.exists():
         return
 
     legacy_libs = legacy_root / "libraries"
     legacy_assets = legacy_root / "assets"
+    legacy_versions_dir = legacy_root / "versions"
 
     if logger:
-        logger("Migrating legacy global resources (USERDIR/global) -> USERDIR/{libraries,assets}...")
+        logger("Migrating legacy resources (USERDIR/global) -> USERDIR/{libraries,assets}...")
 
     merge_move_tree(legacy_libs, GLOBAL_LIBRARIES_DIR)
     merge_move_tree(legacy_assets, GLOBAL_ASSETS_DIR)
 
-    # Update existing args files that referenced USERDIR/global/{libraries,assets}
-    # and USERDIR/global/versions (legacy location we no longer use).
+    # Migrate any legacy vanilla jars stored under USERDIR/global/versions/<ver>/<ver>.jar
+    if legacy_versions_dir.exists():
+        for ver_dir in legacy_versions_dir.iterdir():
+            if not ver_dir.is_dir():
+                continue
+            version_id = ver_dir.name
+            jar = ver_dir / f"{version_id}.jar"
+            if not jar.exists():
+                continue
+
+            target_dir = GLOBAL_LIBRARIES_DIR / "net" / "minecraft" / "client" / version_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{version_id}.jar"
+
+            if not target.exists():
+                try:
+                    shutil.move(str(jar), str(target))
+                except OSError:
+                    try:
+                        shutil.copy2(jar, target)
+                    except OSError:
+                        pass
+
+        # best-effort cleanup
+        for p in sorted(legacy_versions_dir.rglob("*"), reverse=True):
+            if p.is_dir():
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
+        try:
+            legacy_versions_dir.rmdir()
+        except OSError:
+            pass
+
+    # Update existing args files that referenced USERDIR/global/{libraries,assets,versions}.
     legacy_libs_str = str(legacy_libs.resolve())
     legacy_assets_str = str(legacy_assets.resolve())
     legacy_versions_str = str((legacy_root / "versions").resolve())
@@ -318,6 +362,7 @@ def migrate_legacy_global_resources(logger=None):
                 content = p.read_text(encoding="utf-8")
             except OSError:
                 continue
+
             updated = (
                 content
                 .replace(legacy_libs_str, new_libs_str)
@@ -330,9 +375,9 @@ def migrate_legacy_global_resources(logger=None):
                 except OSError:
                     pass
 
-    # Remove legacy_root if empty
+    # Remove legacy_root completely (it should be empty after migrations above).
     try:
-        legacy_root.rmdir()
+        shutil.rmtree(legacy_root)
     except OSError:
         pass
 
@@ -432,6 +477,7 @@ def create_default_instance_json(mp_dir: Path, name: str) -> dict:
             "requiredMemory": 0,
             "requiredPermGen": 0,
             "maximumMemory": 4096,
+            "additionalJvmArgs": "",
             "quickPlay": {},
             "isDev": False,
             "isPlayable": True,
@@ -1539,7 +1585,12 @@ class MinecraftLauncherApp:
 
         inst_loader = (get_instance_loader(instance) or "forge").lower()
         inst_mc = get_instance_minecraft_version(instance) or ""
-        inst_max_mem = str(((instance.get("launcher") or {}).get("maximumMemory") or 4096))
+        launcher_cfg = instance.get("launcher") or {}
+        inst_max_mem = str((launcher_cfg.get("maximumMemory") or 4096))
+        inst_min_mem = str((launcher_cfg.get("requiredMemory") or 0))
+        inst_extra_jvm = launcher_cfg.get("additionalJvmArgs") or ""
+        if not isinstance(inst_extra_jvm, str):
+            inst_extra_jvm = ""
 
         Label(
             dialog,
@@ -1617,6 +1668,50 @@ class MinecraftLauncherApp:
         )
         mem_entry.grid(row=0, column=5, sticky="w", padx=(6, 0))
 
+        Label(
+            settings_frame,
+            text="Min memory (MB):",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        min_mem_var = StringVar(value=inst_min_mem)
+        min_mem_entry = Entry(
+            settings_frame,
+            textvariable=min_mem_var,
+            bg="#1f2616",
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            highlightthickness=1,
+            highlightbackground="#101509",
+            highlightcolor=self.accent_color,
+            width=10,
+        )
+        min_mem_entry.grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
+
+        Label(
+            settings_frame,
+            text="Extra JVM args:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).grid(row=1, column=2, sticky="w", pady=(6, 0))
+
+        extra_jvm_var = StringVar(value=inst_extra_jvm)
+        extra_jvm_entry = Entry(
+            settings_frame,
+            textvariable=extra_jvm_var,
+            bg="#1f2616",
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            highlightthickness=1,
+            highlightbackground="#101509",
+            highlightcolor=self.accent_color,
+            width=45,
+        )
+        extra_jvm_entry.grid(row=1, column=3, columnspan=3, sticky="we", padx=(6, 0), pady=(6, 0))
+
         def save_instance_settings():
             inst = load_instance_json(mp_dir) or create_default_instance_json(mp_dir, name)
             launcher = inst.get("launcher") or {}
@@ -1625,6 +1720,8 @@ class MinecraftLauncherApp:
             mc = mc_var.get().strip()
             loader = normalize_loader_name(loader_var.get())
             max_mem_raw = mem_var.get().strip()
+            min_mem_raw = min_mem_var.get().strip()
+            extra_jvm_raw = extra_jvm_var.get().strip()
 
             # loaderVersion.type uses capitalized loader name, rawVersion keeps "<mc>-<loaderver>".
             if loader == "forge":
@@ -1656,6 +1753,13 @@ class MinecraftLauncherApp:
                 launcher["maximumMemory"] = int(max_mem_raw) if max_mem_raw else launcher.get("maximumMemory", 4096)
             except ValueError:
                 launcher["maximumMemory"] = launcher.get("maximumMemory", 4096)
+
+            try:
+                launcher["requiredMemory"] = int(min_mem_raw) if min_mem_raw else launcher.get("requiredMemory", 0)
+            except ValueError:
+                launcher["requiredMemory"] = launcher.get("requiredMemory", 0)
+
+            launcher["additionalJvmArgs"] = extra_jvm_raw
 
             inst["launcher"] = launcher
             save_instance_json(mp_dir, inst)
@@ -2381,6 +2485,30 @@ class MinecraftLauncherApp:
             )
             return
 
+        instance = load_instance_json(mp_dir)
+        if instance is None:
+            instance = create_default_instance_json(mp_dir, name)
+            save_instance_json(mp_dir, instance)
+
+        launcher_cfg = instance.get("launcher") or {}
+        max_mem = launcher_cfg.get("maximumMemory")
+        min_mem = launcher_cfg.get("requiredMemory")
+        extra_jvm = launcher_cfg.get("additionalJvmArgs")
+
+        try:
+            max_mem = int(max_mem) if max_mem else None
+        except (TypeError, ValueError):
+            max_mem = None
+        try:
+            min_mem = int(min_mem) if min_mem else None
+        except (TypeError, ValueError):
+            min_mem = None
+        if min_mem == 0:
+            min_mem = None
+
+        if not isinstance(extra_jvm, str):
+            extra_jvm = ""
+
         java_exe = get_java_executable()
         if not java_exe.exists():
             messagebox.showerror(
@@ -2411,6 +2539,8 @@ class MinecraftLauncherApp:
             return
 
         try:
+            self.open_console_window()
+
             self.log(f"Applying modpack '{name}'...", source="LAUNCHER")
             self.root.update_idletasks()
 
@@ -2430,16 +2560,30 @@ class MinecraftLauncherApp:
             os.makedirs(res_dst, exist_ok=True)
             copy_tree(str(res_src), str(res_dst))
 
+            mem_note = []
+            if max_mem:
+                mem_note.append(f"-Xmx{max_mem}M")
+            if min_mem:
+                mem_note.append(f"-Xms{min_mem}M")
+
+            extra = (" " + " ".join(mem_note)) if mem_note else ""
             self.log(
-                f"Modpack '{name}' applied. Launching Minecraft with USERDIR/vanilla/{args_name}...",
+                f"Modpack '{name}' applied. Launching Minecraft with USERDIR/vanilla/{args_name}{extra}...",
                 source="LAUNCHER",
             )
-            self._launch_with_argfile(java_exe, args_file)
+            self._launch_with_argfile(java_exe, args_file, max_mem=max_mem, min_mem=min_mem, extra_jvm=extra_jvm)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply modpack or launch: {e}")
             self.log("Error while applying modpack / launching.", source="LAUNCHER")
 
-    def _launch_with_argfile(self, java_exe: Path, args_file: Path):
+    def _launch_with_argfile(
+        self,
+        java_exe: Path,
+        args_file: Path,
+        max_mem: Optional[int] = None,
+        min_mem: Optional[int] = None,
+        extra_jvm: str = "",
+    ):
         """Launch Java with @<args_file> from USERDIR and stream logs to console."""
         try:
             rel_args_path = args_file.relative_to(INSTALL_DIR)
@@ -2448,9 +2592,31 @@ class MinecraftLauncherApp:
 
         argfile_arg = f"@{rel_args_path.as_posix()}"
 
+        cmd = [str(java_exe)]
+
+        if extra_jvm.strip():
+            extra_args = shlex.split(extra_jvm, posix=not sys.platform.startswith("win"))
+            cmd.extend(extra_args)
+
+        if max_mem:
+            cmd.append(f"-Xmx{max_mem}M")
+        if min_mem:
+            cmd.append(f"-Xms{min_mem}M")
+
+        cmd.append(argfile_arg)
+
+        try:
+            if sys.platform.startswith("win"):
+                cmd_str = subprocess.list2cmdline(cmd)
+            else:
+                cmd_str = shlex.join(cmd)
+            self.log(f"Launch command: {cmd_str}", source="LAUNCHER")
+        except Exception:
+            self.log(f"Launch command: {cmd}", source="LAUNCHER")
+
         try:
             proc = subprocess.Popen(
-                [str(java_exe), argfile_arg],
+                cmd,
                 cwd=str(INSTALL_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
