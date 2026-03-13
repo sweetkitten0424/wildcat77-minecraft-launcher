@@ -41,14 +41,38 @@ from tkinter import (
 APP_NAME = "BlockCraft Launcher"
 LAUNCHER_VERSION = "1.3.0"
 
-CONFIG_FILE = "launcher_config.json"
 MODPACKS_DIR = "modpacks"
 
 # Installation directory (this is USERDIR)
 INSTALL_DIR = Path(__file__).resolve().parent
 
+# ATLauncher-like configs layout (matches your screenshots)
+CONFIGS_DIR = INSTALL_DIR / "configs"
+CONFIGS_COMMON_DIR = CONFIGS_DIR / "common"
+CONFIGS_IMAGES_DIR = CONFIGS_DIR / "images"
+CONFIGS_SKINS_DIR = CONFIGS_IMAGES_DIR / "skins"
+CONFIGS_JSON_DIR = CONFIGS_DIR / "json"
+CONFIGS_JSON_MINECRAFT_DIR = CONFIGS_JSON_DIR / "minecraft"
+CONFIGS_THEMES_DIR = CONFIGS_DIR / "themes"
+
+# Primary launcher settings file (ATLauncher uses configs/json/config.json)
+CONFIG_FILE = CONFIGS_JSON_DIR / "config.json"
+LEGACY_CONFIG_FILE = INSTALL_DIR / "launcher_config.json"
+
+# Additional ATLauncher-like files (created for structure parity)
+ATLAUNCHER_JSON_FILE = CONFIGS_DIR / "ATLauncher.json"
+ACCOUNTS_JSON_FILE = CONFIGS_DIR / "accounts.json"
+JAVA_RUNTIMES_JSON_FILE = CONFIGS_JSON_DIR / "java_runtimes.json"
+LWJGL_JSON_FILE = CONFIGS_JSON_DIR / "lwjgl.json"
+MINECRAFT_VERSIONS_JSON_FILE = CONFIGS_JSON_DIR / "minecraft_versions.json"
+NEWNEWS_JSON_FILE = CONFIGS_JSON_DIR / "newnews.json"
+PACKSNEW_JSON_FILE = CONFIGS_JSON_DIR / "packsnew.json"
+RUNTIMES_JSON_FILE = CONFIGS_JSON_DIR / "runtimes.json"
+USERS_JSON_FILE = CONFIGS_JSON_DIR / "users.json"
+VERSION_JSON_FILE = CONFIGS_JSON_DIR / "version.json"
+
 # Java runtime configuration
-JAVA_RUNTIME_DIR_NAME = "java-runtime"
+JAVA_RUNTIME_DIR_NAME = "runtime"
 JAVA_RUNTIME_VERSION = "21.0.7"  # version we expect
 JAVA_RUNTIME_VERSION_FILE = "java_runtime_version.txt"
 
@@ -81,34 +105,79 @@ MAX_PARALLEL_DOWNLOADS = 50
 CURSEFORGE_API_KEY = ""
 
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {
-            "minecraft_dir": "",
-            "last_selected_modpack": "",
-            "java_runtime_version": "",
-            # auth / game placeholders (basic, manual for now)
-            "auth_player_name": "Player",
-            "auth_uuid": "00000000-0000-0000-0000-000000000000",
-            "auth_access_token": "0",
-            "user_type": "mojang",
-            "version_type": "release",
-        }
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def ensure_configs_layout():
+    CONFIGS_COMMON_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIGS_SKINS_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIGS_JSON_MINECRAFT_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIGS_THEMES_DIR.mkdir(parents=True, exist_ok=True)
 
-    data.setdefault("minecraft_dir", "")
-    data.setdefault("last_selected_modpack", "")
-    data.setdefault("java_runtime_version", "")
-    data.setdefault("auth_player_name", "Player")
-    data.setdefault("auth_uuid", "00000000-0000-0000-0000-000000000000")
-    data.setdefault("auth_access_token", "0")
-    data.setdefault("user_type", "mojang")
-    data.setdefault("version_type", "release")
+    def write_if_missing(path: Path, obj):
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+
+    write_if_missing(ATLAUNCHER_JSON_FILE, {"appName": APP_NAME, "version": LAUNCHER_VERSION})
+    write_if_missing(ACCOUNTS_JSON_FILE, {"accounts": [], "selectedAccount": None})
+
+    # Create the files shown in ATLauncher configs/json.
+    write_if_missing(JAVA_RUNTIMES_JSON_FILE, {})
+    write_if_missing(LWJGL_JSON_FILE, {})
+    write_if_missing(MINECRAFT_VERSIONS_JSON_FILE, {})
+    write_if_missing(NEWNEWS_JSON_FILE, {})
+    write_if_missing(PACKSNEW_JSON_FILE, {})
+    write_if_missing(RUNTIMES_JSON_FILE, {})
+    write_if_missing(USERS_JSON_FILE, {})
+    write_if_missing(VERSION_JSON_FILE, {"launcherVersion": LAUNCHER_VERSION})
+
+
+def _default_config() -> dict:
+    return {
+        "minecraft_dir": "",
+        "last_selected_modpack": "",
+        "java_runtime_version": "",
+        # auth / game placeholders (basic, manual for now)
+        "auth_player_name": "Player",
+        "auth_uuid": "00000000-0000-0000-0000-000000000000",
+        "auth_access_token": "0",
+        "user_type": "mojang",
+        "version_type": "release",
+    }
+
+
+def load_config():
+    ensure_configs_layout()
+
+    if not CONFIG_FILE.exists() and LEGACY_CONFIG_FILE.exists():
+        try:
+            legacy = json.loads(LEGACY_CONFIG_FILE.read_text(encoding="utf-8"))
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(json.dumps(legacy, indent=4), encoding="utf-8")
+            try:
+                LEGACY_CONFIG_FILE.unlink()
+            except OSError:
+                pass
+        except Exception:
+            pass
+
+    if not CONFIG_FILE.exists():
+        data = _default_config()
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    else:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    defaults = _default_config()
+    for k, v in defaults.items():
+        data.setdefault(k, v)
+
     return data
 
 
 def save_config(config):
+    ensure_configs_layout()
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=4)
 
@@ -286,6 +355,8 @@ def migrate_legacy_vanilla_version_resources(logger=None):
     if not VANILLA_DIR.exists():
         return
 
+    ensure_configs_layout()
+
     for version_root in sorted(VANILLA_DIR.iterdir()):
         if not version_root.is_dir():
             continue
@@ -294,6 +365,7 @@ def migrate_legacy_vanilla_version_resources(logger=None):
         legacy_libs = version_root / "libraries"
         legacy_assets = version_root / "assets"
         legacy_client = version_root / "versions" / version_id / f"{version_id}.jar"
+        legacy_version_json = version_root / f"{version_id}.json"
 
         new_client_dir = GLOBAL_LIBRARIES_DIR / "net" / "minecraft" / "client" / version_id
         new_client = new_client_dir / f"{version_id}.jar"
@@ -317,6 +389,18 @@ def migrate_legacy_vanilla_version_resources(logger=None):
                     shutil.copy2(legacy_client, new_client)
                 except OSError:
                     pass
+
+        # Migrate legacy stored version JSON into configs/json/minecraft/<version>.json
+        if legacy_version_json.exists():
+            target = CONFIGS_JSON_MINECRAFT_DIR / f"{version_id}.json"
+            if not target.exists():
+                try:
+                    shutil.move(str(legacy_version_json), str(target))
+                except OSError:
+                    try:
+                        shutil.copy2(legacy_version_json, target)
+                    except OSError:
+                        pass
 
         legacy_versions_dir = version_root / "versions"
         if legacy_versions_dir.exists():
@@ -730,7 +814,16 @@ def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
 
 def fetch_version_manifest():
     with urllib.request.urlopen(VERSION_MANIFEST_URL) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        manifest = json.loads(resp.read().decode("utf-8"))
+
+    # Mirror ATLauncher-style cached manifest name.
+    ensure_configs_layout()
+    try:
+        MINECRAFT_VERSIONS_JSON_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+    return manifest
 
 
 def find_version_in_manifest(manifest, version_id: str):
@@ -757,15 +850,21 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
     with urllib.request.urlopen(version_url) as resp:
         version_data = json.loads(resp.read().decode("utf-8"))
 
-    # Per-version storage for version json, but shared libs/assets.
+    # Version JSON files are stored like ATLauncher:
+    #   USERDIR/configs/json/minecraft/<version>.json
+    # We still keep USERDIR/vanilla/<version>/ for legacy migration helpers.
     version_root = VANILLA_DIR / version_id
     version_root.mkdir(parents=True, exist_ok=True)
 
+    ensure_configs_layout()
+    try:
+        mc_json_path = CONFIGS_JSON_MINECRAFT_DIR / f"{version_id}.json"
+        mc_json_path.write_text(json.dumps(version_data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
     GLOBAL_LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
     GLOBAL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-
-    version_json_path = version_root / f"{version_id}.json"
-    version_json_path.write_text(json.dumps(version_data, indent=2), encoding="utf-8")
 
     # Store the vanilla client jar in the shared libraries folder in a Maven-like layout:
     #   USERDIR/libraries/net/minecraft/client/<mcVersion>/<mcVersion>.jar
@@ -1050,7 +1149,7 @@ class MinecraftLauncherApp:
         save_btn = Button(
             toolbar,
             text="Save",
-               command=self.console_save_to_file,
+            command=self.console_save_to_file,
             bg="#4d5c32",
             fg=self.text_color,
             activebackground=self.button_hover_color,
@@ -1147,6 +1246,7 @@ class MinecraftLauncherApp:
     # ----- background tasks -----
 
     def _background_startup_tasks(self):
+        ensure_configs_layout()
         GLOBAL_LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
         GLOBAL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         migrate_legacy_global_resources(self.log)
