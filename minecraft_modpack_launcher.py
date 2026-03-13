@@ -13,6 +13,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import (
     Tk,
     Frame,
@@ -69,6 +70,10 @@ ASSET_BASE_URL = "https://resources.download.minecraft.net"
 JAVA_RUNTIME_ZIP_URL = (
     "https://download.oracle.com/java/21/latest/jdk-21_windows-x64_bin.zip"
 )
+
+# Parallel downloads configuration
+PARALLEL_DOWNLOADS_ENABLED = True
+MAX_PARALLEL_DOWNLOADS = 50
 
 # CurseForge API key (hard-coded).
 # WARNING: Anyone who can read this file can see your key.
@@ -150,6 +155,48 @@ def download_to_file(url: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as resp, open(dest, "wb") as out_f:
         shutil.copyfileobj(resp, out_f)
+
+
+def parallel_download_files(download_tasks: list, logger, max_workers: int = MAX_PARALLEL_DOWNLOADS):
+    """Download multiple files in parallel.
+
+    download_tasks: list of (url, dest_path, description)
+    """
+    if not download_tasks:
+        return
+
+    total = len(download_tasks)
+    log_every = 1 if total <= 200 else 50
+
+    if not PARALLEL_DOWNLOADS_ENABLED or total <= 1:
+        done = 0
+        for url, dest, desc in download_tasks:
+            done += 1
+            logger(f"Downloading {desc}...", source="LAUNCHER")
+            download_to_file(url, dest)
+            if log_every != 1 and (done % log_every == 0 or done == total):
+                logger(f"Downloaded {done}/{total} files...", source="LAUNCHER")
+        return
+
+    def task_runner(task):
+        url, dest, desc = task
+        download_to_file(url, dest)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(task_runner, t): t for t in download_tasks}
+        done = 0
+        for f in as_completed(futures):
+            url, dest, desc = futures[f]
+            try:
+                f.result()
+            except Exception as e:
+                logger(f"Failed to download {desc}: {e}", source="LAUNCHER")
+                raise
+            done += 1
+            if log_every == 1:
+                logger(f"Downloaded {desc} ({done}/{total})", source="LAUNCHER")
+            elif done % log_every == 0 or done == total:
+                logger(f"Downloaded {done}/{total} files...", source="LAUNCHER")
 
 
 def merge_move_tree(src: Path, dst: Path):
@@ -654,19 +701,18 @@ def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
             index = json.loads(idx_f.read().decode("utf-8"))
 
         files = index.get("files", [])
-        for i, file_info in enumerate(files, start=1):
+        download_tasks = []
+        for file_info in files:
             path = file_info.get("path")
             downloads = file_info.get("downloads") or []
             if not path or not downloads:
                 continue
             url = downloads[0]
             target = dest_modpack_dir / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            logger(f"Downloading Modrinth file {i}/{len(files)}...", source="LAUNCHER")
-            try:
-                download_to_file(url, target)
-            except Exception as e:
-                logger(f"Failed to download {url}: {e}", source="LAUNCHER")
+            download_tasks.append((url, target, f"mrpack {Path(path).name}"))
+
+        if download_tasks:
+            parallel_download_files(download_tasks, logger)
 
         overrides_prefix = "overrides/"
         for name in namelist:
@@ -743,8 +789,9 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
         download_to_file(client_url, client_jar_path)
 
     libraries = version_data.get("libraries", [])
-    total_libs = len(libraries)
-    for i, lib in enumerate(libraries, start=1):
+    download_tasks = []
+
+    for lib in libraries:
         downloads = lib.get("downloads", {})
         artifact = downloads.get("artifact")
         if not artifact:
@@ -756,8 +803,10 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
         target = GLOBAL_LIBRARIES_DIR / Path(path)
         if target.exists():
             continue
-        logger(f"Downloading library {i}/{total_libs}...")
-        download_to_file(url, target)
+        download_tasks.append((url, target, f"library {Path(path).name}"))
+
+    if download_tasks:
+        parallel_download_files(download_tasks, logger)
 
     asset_index_info = version_data.get("assetIndex")
     if asset_index_info:
@@ -775,21 +824,19 @@ def download_vanilla_version(version_id: str, config, logger) -> Path:
         objects_dir.mkdir(parents=True, exist_ok=True)
 
         objects = asset_index.get("objects", {})
-        total_objects = len(objects)
-        for i, (name, obj) in enumerate(objects.items(), start=1):
+        download_tasks = []
+
+        for name, obj in objects.items():
             hash_ = obj["hash"]
             prefix = hash_[:2]
             url = f"{ASSET_BASE_URL}/{prefix}/{hash_}"
             target = objects_dir / prefix / hash_
             if target.exists():
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if i % 50 == 0:
-                logger(f"Downloading assets {i}/{total_objects}...")
-            try:
-                download_to_file(url, target)
-            except Exception as e:
-                logger(f"Failed to download asset {name} ({url}): {e}")
+            download_tasks.append((url, target, f"asset {name}"))
+
+        if download_tasks:
+            parallel_download_files(download_tasks, logger)
 
     args_file = generate_java_args_from_version_json(
         version_id,
