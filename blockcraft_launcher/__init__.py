@@ -1,0 +1,1 @@
+"""BlockCraft Launcher package."""
