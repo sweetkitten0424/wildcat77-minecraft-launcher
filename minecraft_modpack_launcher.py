@@ -101,8 +101,20 @@ MAX_PARALLEL_DOWNLOADS = 50
 
 # CurseForge API key (hard-coded).
 # WARNING: Anyone who can read this file can see your key.
-# Replace the placeholder with your real key string.
+# IMPORTANT: Do not use ATLauncher/other launchers' keys. Get your own.
 CURSEFORGE_API_KEY = ""
+
+CURSEFORGE_GAME_ID_MINECRAFT = 432
+CURSEFORGE_MODLOADER_TYPE_IDS = {
+    "forge": 1,
+    "fabric": 4,
+    "quilt": 5,
+    "neoforge": 6,
+}
+
+MODRINTH_API_URL = "https://api.modrinth.com/v2"
+
+DEFAULT_JAVA_PARAMETERS = "-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M"
 
 
 def ensure_configs_layout():
@@ -608,7 +620,7 @@ def create_default_instance_json(mp_dir: Path, name: str) -> dict:
             "requiredMemory": 0,
             "requiredPermGen": 0,
             "maximumMemory": 4096,
-            "additionalJvmArgs": "",
+            "additionalJvmArgs": DEFAULT_JAVA_PARAMETERS,
             "quickPlay": {},
             "isDev": False,
             "isPlayable": True,
@@ -2309,7 +2321,7 @@ class MinecraftLauncherApp:
         else:
             project_id = text
 
-        url_project = f"https://api.modrinth.com/v2/project/{project_id}"
+        url_project = f"{MODRINTH_API_URL}/project/{project_id}"
         with urllib.request.urlopen(url_project) as resp:
             project = json.loads(resp.read().decode("utf-8"))
 
@@ -2317,7 +2329,7 @@ class MinecraftLauncherApp:
         slug = project.get("slug", project_id)
         self.log(f"Modrinth project resolved: {slug} ({project_id})", source="LAUNCHER")
 
-        versions_url = f"https://api.modrinth.com/v2/project/{project_id}/version"
+        versions_url = f"{MODRINTH_API_URL}/project/{project_id}/version"
 
         params = {}
         if target_mc_version:
@@ -2339,7 +2351,7 @@ class MinecraftLauncherApp:
             # If filters were too strict, retry without filters
             if params:
                 self.log("No matching Modrinth versions found; retrying without filters...", source="LAUNCHER")
-                with urllib.request.urlopen(f"https://api.modrinth.com/v2/project/{project_id}/version") as resp:
+                with urllib.request.urlopen(f"{MODRINTH_API_URL}/project/{project_id}/version") as resp:
                     versions = json.loads(resp.read().decode("utf-8"))
 
         if not versions:
@@ -2384,7 +2396,6 @@ class MinecraftLauncherApp:
 
     def _cf_resolve_project(self, text: str) -> int:
         import re
-        import urllib.parse
 
         text = text.strip()
 
@@ -2397,7 +2408,7 @@ class MinecraftLauncherApp:
         else:
             slug = text
 
-        params = f"?gameId=432&searchFilter={urllib.parse.quote(slug)}"
+        params = f"?gameId={CURSEFORGE_GAME_ID_MINECRAFT}&searchFilter={urllib.parse.quote(slug)}"
         data = self._cf_api_request("/v1/mods/search" + params)
         mods = data.get("data", [])
         if not mods:
@@ -2415,6 +2426,27 @@ class MinecraftLauncherApp:
         target_mc_version: Optional[str],
         target_loader: Optional[str],
     ) -> dict:
+        query = {}
+        if target_mc_version:
+            query["gameVersion"] = target_mc_version
+
+        if target_loader:
+            norm_loader = normalize_loader_name(target_loader)
+            mlt = CURSEFORGE_MODLOADER_TYPE_IDS.get(norm_loader)
+            if mlt is not None:
+                query["modLoaderType"] = mlt
+
+        if query:
+            try:
+                data = self._cf_api_request(
+                    f"/v1/mods/{mod_id}/files?{urllib.parse.urlencode(query)}"
+                )
+                files = data.get("data", [])
+                if files:
+                    return files[0]
+            except urllib.error.HTTPError:
+                pass
+
         data = self._cf_api_request(f"/v1/mods/{mod_id}/files")
         files = data.get("data", [])
         if not files:
@@ -2447,7 +2479,6 @@ class MinecraftLauncherApp:
         if matching:
             return matching[0]
 
-        # Fall back: only require MC version
         if target_mc_version:
             for f in files:
                 gv = f.get("gameVersions") or []
