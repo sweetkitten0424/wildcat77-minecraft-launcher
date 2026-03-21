@@ -5,15 +5,15 @@ import shutil
 import subprocess
 import sys
 import threading
-import urllib.request
 import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import (
     Tk,
     Frame,
@@ -34,19 +34,17 @@ from tkinter import (
     NORMAL,
 )
 
-# --------------------------------------------------------------------------------------
-# Configuration / constants
-# --------------------------------------------------------------------------------------
-
 APP_NAME = "BlockCraft Launcher"
-LAUNCHER_VERSION = "1.3.0"
+LAUNCHER_VERSION = "1.3.1"
 
-MODPACKS_DIR = "modpacks"
-
-# Installation directory (this is USERDIR)
 INSTALL_DIR = Path(__file__).resolve().parent
 
-# ATLauncher-like configs layout (matches your screenshots)
+MODPACKS_DIR = INSTALL_DIR / "modpacks"
+VANILLA_DIR = INSTALL_DIR / "vanilla"
+LIBRARIES_DIR = INSTALL_DIR / "libraries"
+ASSETS_DIR = INSTALL_DIR / "assets"
+
+# ATLauncher-style configs layout (optional but kept for parity)
 CONFIGS_DIR = INSTALL_DIR / "configs"
 CONFIGS_COMMON_DIR = CONFIGS_DIR / "common"
 CONFIGS_IMAGES_DIR = CONFIGS_DIR / "images"
@@ -55,11 +53,9 @@ CONFIGS_JSON_DIR = CONFIGS_DIR / "json"
 CONFIGS_JSON_MINECRAFT_DIR = CONFIGS_JSON_DIR / "minecraft"
 CONFIGS_THEMES_DIR = CONFIGS_DIR / "themes"
 
-# Primary launcher settings file (ATLauncher uses configs/json/config.json)
 CONFIG_FILE = CONFIGS_JSON_DIR / "config.json"
 LEGACY_CONFIG_FILE = INSTALL_DIR / "launcher_config.json"
 
-# Additional ATLauncher-like files (created for structure parity)
 ATLAUNCHER_JSON_FILE = CONFIGS_DIR / "ATLauncher.json"
 ACCOUNTS_JSON_FILE = CONFIGS_DIR / "accounts.json"
 JAVA_RUNTIMES_JSON_FILE = CONFIGS_JSON_DIR / "java_runtimes.json"
@@ -71,39 +67,22 @@ RUNTIMES_JSON_FILE = CONFIGS_JSON_DIR / "runtimes.json"
 USERS_JSON_FILE = CONFIGS_JSON_DIR / "users.json"
 VERSION_JSON_FILE = CONFIGS_JSON_DIR / "version.json"
 
-# Java runtime configuration
+# Java runtime (bundled)
 JAVA_RUNTIME_DIR_NAME = "runtime"
-JAVA_RUNTIME_VERSION = "21.0.7"  # version we expect
+JAVA_RUNTIME_VERSION = "21.0.7"
 JAVA_RUNTIME_VERSION_FILE = "java_runtime_version.txt"
-
-# Vanilla args directory and pattern
-VANILLA_DIR = INSTALL_DIR / "vanilla"  # all args files live here
-
-# Shared resources (download once, reused by all versions/instances)
-# Stored at:
-#   USERDIR/libraries
-#   USERDIR/assets
-GLOBAL_LIBRARIES_DIR = INSTALL_DIR / "libraries"
-GLOBAL_ASSETS_DIR = INSTALL_DIR / "assets"
+JAVA_RUNTIME_ZIP_URL = "https://download.oracle.com/java/21/latest/jdk-21_windows-x64_bin.zip"
 
 # Mojang endpoints
 VERSION_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 ASSET_BASE_URL = "https://resources.download.minecraft.net"
 
-# Oracle JDK ZIP you’re using
-JAVA_RUNTIME_ZIP_URL = (
-    "https://download.oracle.com/java/21/latest/jdk-21_windows-x64_bin.zip"
-)
-
-# Parallel downloads configuration
+# Parallel downloads
 PARALLEL_DOWNLOADS_ENABLED = True
-MAX_PARALLEL_DOWNLOADS = 50
+MAX_PARALLEL_DOWNLOADS = 16
 
-# CurseForge API key (hard-coded).
-# WARNING: Anyone who can read this file can see your key.
-# IMPORTANT: Do not use ATLauncher/other launchers' keys. Get your own.
+# CurseForge
 CURSEFORGE_API_KEY = ""
-
 CURSEFORGE_GAME_ID_MINECRAFT = 432
 CURSEFORGE_MODLOADER_TYPE_IDS = {
     "forge": 1,
@@ -132,7 +111,6 @@ def ensure_configs_layout():
     write_if_missing(ATLAUNCHER_JSON_FILE, {"appName": APP_NAME, "version": LAUNCHER_VERSION})
     write_if_missing(ACCOUNTS_JSON_FILE, {"accounts": [], "selectedAccount": None})
 
-    # Create the files shown in ATLauncher configs/json.
     write_if_missing(JAVA_RUNTIMES_JSON_FILE, {})
     write_if_missing(LWJGL_JSON_FILE, {})
     write_if_missing(MINECRAFT_VERSIONS_JSON_FILE, {})
@@ -140,74 +118,99 @@ def ensure_configs_layout():
     write_if_missing(PACKSNEW_JSON_FILE, {})
     write_if_missing(RUNTIMES_JSON_FILE, {})
     write_if_missing(USERS_JSON_FILE, {})
-    write_if_missing(VERSION_JSON_FILE, {"launcherVersion": LAUNCHER_VERSION})
+    write_if_missing(VERSION_JSON_FILE, {})
 
 
-def _default_config() -> dict:
-    return {
-        "minecraft_dir": "",
-        "last_selected_modpack": "",
-        "java_runtime_version": "",
-        # auth / game placeholders (basic, manual for now)
-        "auth_player_name": "Player",
-        "auth_uuid": "00000000-0000-0000-0000-000000000000",
-        "auth_access_token": "0",
-        "user_type": "mojang",
-        "version_type": "release",
-    }
-
-
-def load_config():
+def load_config() -> dict:
     ensure_configs_layout()
 
     if not CONFIG_FILE.exists() and LEGACY_CONFIG_FILE.exists():
         try:
-            legacy = json.loads(LEGACY_CONFIG_FILE.read_text(encoding="utf-8"))
+            data = json.loads(LEGACY_CONFIG_FILE.read_text(encoding="utf-8"))
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(json.dumps(legacy, indent=4), encoding="utf-8")
-            try:
-                LEGACY_CONFIG_FILE.unlink()
-            except OSError:
-                pass
+            CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
 
-    if not CONFIG_FILE.exists():
-        data = _default_config()
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
     else:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = {}
 
-    defaults = _default_config()
-    for k, v in defaults.items():
-        data.setdefault(k, v)
+    data.setdefault("minecraft_dir", "")
+    data.setdefault("last_selected_modpack", "")
+    data.setdefault("java_runtime_version", "")
+    data.setdefault("auth_player_name", "Player")
+    data.setdefault("auth_uuid", "00000000-0000-0000-0000-000000000000")
+    data.setdefault("auth_access_token", "0")
+    data.setdefault("user_type", "mojang")
+    data.setdefault("version_type", "release")
 
     return data
 
 
-def save_config(config):
+def save_config(cfg: dict):
     ensure_configs_layout()
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
 def ensure_modpacks_dir():
-    os.makedirs(MODPACKS_DIR, exist_ok=True)
+    MODPACKS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def list_modpacks():
+def list_modpacks() -> list[str]:
     ensure_modpacks_dir()
-    entries = []
-    for p in sorted(Path(MODPACKS_DIR).iterdir()):
+    names = []
+    for p in sorted(MODPACKS_DIR.iterdir()):
         if p.is_dir():
-            entries.append(p.name)
-    return entries
+            names.append(p.name)
+    return names
 
 
-def copy_tree(src, dst):
+def download_to_file(url: str, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as resp, open(dest, "wb") as out_f:
+        shutil.copyfileobj(resp, out_f)
+
+
+def parallel_download_files(download_tasks, logger, max_workers: int = MAX_PARALLEL_DOWNLOADS):
+    if not download_tasks:
+        return
+
+    if not PARALLEL_DOWNLOADS_ENABLED or len(download_tasks) == 1:
+        total = len(download_tasks)
+        for i, (url, dest, desc) in enumerate(download_tasks, start=1):
+            logger(f"Downloading {desc} ({i}/{total})...", source="LAUNCHER")
+            download_to_file(url, dest)
+        return
+
+    total = len(download_tasks)
+    log_every = 1 if total <= 200 else 50
+
+    def worker(url: str, dest: Path):
+        download_to_file(url, dest)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for url, dest, desc in download_tasks:
+            futures[pool.submit(worker, url, dest)] = desc
+
+        for f in as_completed(futures):
+            desc = futures[f]
+            f.result()
+            done += 1
+            if log_every == 1:
+                logger(f"Downloaded {desc} ({done}/{total})", source="LAUNCHER")
+            elif done % log_every == 0 or done == total:
+                logger(f"Downloaded {done}/{total} files...", source="LAUNCHER")
+
+
+def copy_tree(src: str, dst: str):
     if not os.path.exists(src):
         return
     os.makedirs(dst, exist_ok=True)
@@ -221,7 +224,7 @@ def copy_tree(src, dst):
             shutil.copy2(src_file, dst_file)
 
 
-def clean_dir(path):
+def clean_dir(path: str):
     if not os.path.exists(path):
         return
     for item in os.listdir(path):
@@ -230,54 +233,6 @@ def clean_dir(path):
             shutil.rmtree(full)
         else:
             os.remove(full)
-
-
-def download_to_file(url: str, dest: Path):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as resp, open(dest, "wb") as out_f:
-        shutil.copyfileobj(resp, out_f)
-
-
-def parallel_download_files(download_tasks: list, logger, max_workers: int = MAX_PARALLEL_DOWNLOADS):
-    """Download multiple files in parallel.
-
-    download_tasks: list of (url, dest_path, description)
-    """
-    if not download_tasks:
-        return
-
-    total = len(download_tasks)
-    log_every = 1 if total <= 200 else 50
-
-    if not PARALLEL_DOWNLOADS_ENABLED or total <= 1:
-        done = 0
-        for url, dest, desc in download_tasks:
-            done += 1
-            logger(f"Downloading {desc}...", source="LAUNCHER")
-            download_to_file(url, dest)
-            if log_every != 1 and (done % log_every == 0 or done == total):
-                logger(f"Downloaded {done}/{total} files...", source="LAUNCHER")
-        return
-
-    def task_runner(task):
-        url, dest, desc = task
-        download_to_file(url, dest)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(task_runner, t): t for t in download_tasks}
-        done = 0
-        for f in as_completed(futures):
-            url, dest, desc = futures[f]
-            try:
-                f.result()
-            except Exception as e:
-                logger(f"Failed to download {desc}: {e}", source="LAUNCHER")
-                raise
-            done += 1
-            if log_every == 1:
-                logger(f"Downloaded {desc} ({done}/{total})", source="LAUNCHER")
-            elif done % log_every == 0 or done == total:
-                logger(f"Downloaded {done}/{total} files...", source="LAUNCHER")
 
 
 def merge_move_tree(src: Path, dst: Path):
@@ -294,354 +249,44 @@ def merge_move_tree(src: Path, dst: Path):
         if not target.exists():
             shutil.move(str(p), str(target))
 
+    # best-effort cleanup
     for p in sorted(src.rglob("*"), reverse=True):
         if p.is_dir():
             try:
                 p.rmdir()
             except OSError:
                 pass
-
     try:
         src.rmdir()
     except OSError:
         pass
 
 
-def migrate_legacy_args_files(logger=None):
-    if not VANILLA_DIR.exists():
-        return
-
-    libs_root = str(GLOBAL_LIBRARIES_DIR.resolve())
-    assets_root = str(GLOBAL_ASSETS_DIR.resolve())
-    libs_root_posix = GLOBAL_LIBRARIES_DIR.resolve().as_posix()
-    assets_root_posix = GLOBAL_ASSETS_DIR.resolve().as_posix()
-
-    for p in VANILLA_DIR.glob("java_args_*.txt"):
-        version_id = p.stem.replace("java_args_", "", 1)
-
-        legacy_version_root = VANILLA_DIR / version_id
-        legacy_libs = legacy_version_root / "libraries"
-        legacy_assets = legacy_version_root / "assets"
-        legacy_client = legacy_version_root / "versions" / version_id / f"{version_id}.jar"
-
-        new_client = (
-            GLOBAL_LIBRARIES_DIR
-            / "net"
-            / "minecraft"
-            / "client"
-            / version_id
-            / f"{version_id}.jar"
-        )
-
-        replacements = []
-        for src_path, dst_path in (
-            (str(legacy_libs.resolve()), libs_root),
-            (legacy_libs.resolve().as_posix(), libs_root_posix),
-            (str(legacy_assets.resolve()), assets_root),
-            (legacy_assets.resolve().as_posix(), assets_root_posix),
-            (str(legacy_client.resolve()), str(new_client.resolve())),
-            (legacy_client.resolve().as_posix(), new_client.resolve().as_posix()),
-        ):
-            replacements.append((src_path, dst_path))
-
-        try:
-            content = p.read_text(encoding="utf-8")
-        except OSError:
-            continue
-
-        updated = content
-        for src_path, dst_path in replacements:
-            if src_path and dst_path:
-                updated = updated.replace(src_path, dst_path)
-
-        if updated != content:
-            try:
-                p.write_text(updated, encoding="utf-8")
-                if logger:
-                    logger(f"Updated args file paths: {p.name}")
-            except OSError:
-                pass
-
-
-def migrate_legacy_vanilla_version_resources(logger=None):
-    if not VANILLA_DIR.exists():
-        return
-
-    ensure_configs_layout()
-
-    for version_root in sorted(VANILLA_DIR.iterdir()):
-        if not version_root.is_dir():
-            continue
-        version_id = version_root.name
-
-        legacy_libs = version_root / "libraries"
-        legacy_assets = version_root / "assets"
-        legacy_client = version_root / "versions" / version_id / f"{version_id}.jar"
-        legacy_version_json = version_root / f"{version_id}.json"
-
-        new_client_dir = GLOBAL_LIBRARIES_DIR / "net" / "minecraft" / "client" / version_id
-        new_client = new_client_dir / f"{version_id}.jar"
-
-        if legacy_libs.exists():
-            if logger:
-                logger(f"Migrating legacy vanilla libraries for {version_id}...")
-            merge_move_tree(legacy_libs, GLOBAL_LIBRARIES_DIR)
-
-        if legacy_assets.exists():
-            if logger:
-                logger(f"Migrating legacy vanilla assets for {version_id}...")
-            merge_move_tree(legacy_assets, GLOBAL_ASSETS_DIR)
-
-        if legacy_client.exists() and not new_client.exists():
-            new_client_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.move(str(legacy_client), str(new_client))
-            except OSError:
-                try:
-                    shutil.copy2(legacy_client, new_client)
-                except OSError:
-                    pass
-
-        # Migrate legacy stored version JSON into configs/json/minecraft/<version>.json
-        if legacy_version_json.exists():
-            target = CONFIGS_JSON_MINECRAFT_DIR / f"{version_id}.json"
-            if not target.exists():
-                try:
-                    shutil.move(str(legacy_version_json), str(target))
-                except OSError:
-                    try:
-                        shutil.copy2(legacy_version_json, target)
-                    except OSError:
-                        pass
-
-        legacy_versions_dir = version_root / "versions"
-        if legacy_versions_dir.exists():
-            # best-effort cleanup; keep if other data remains
-            for p in sorted(legacy_versions_dir.rglob("*"), reverse=True):
-                if p.is_dir():
-                    try:
-                        p.rmdir()
-                    except OSError:
-                        pass
-            try:
-                legacy_versions_dir.rmdir()
-            except OSError:
-                pass
-
-
-# --------------------------------------------------------------------------------------
-# Shared resources migration (remove legacy USERDIR/global)
-# --------------------------------------------------------------------------------------
-
 def migrate_legacy_global_resources(logger=None):
-    """Migrate the legacy USERDIR/global folder.
-
-    We no longer use USERDIR/global; shared resources now live at:
-      USERDIR/libraries
-      USERDIR/assets
-
-    This migrates what we can, then removes USERDIR/global.
-    """
     legacy_root = INSTALL_DIR / "global"
     if not legacy_root.exists():
         return
 
     legacy_libs = legacy_root / "libraries"
     legacy_assets = legacy_root / "assets"
-    legacy_versions_dir = legacy_root / "versions"
 
     if logger:
-        logger("Migrating legacy resources (USERDIR/global) -> USERDIR/{libraries,assets}...")
+        logger("Migrating legacy USERDIR/global -> USERDIR/{libraries,assets}...", source="LAUNCHER")
 
-    merge_move_tree(legacy_libs, GLOBAL_LIBRARIES_DIR)
-    merge_move_tree(legacy_assets, GLOBAL_ASSETS_DIR)
+    merge_move_tree(legacy_libs, LIBRARIES_DIR)
+    merge_move_tree(legacy_assets, ASSETS_DIR)
 
-    # Migrate any legacy vanilla jars stored under USERDIR/global/versions/<ver>/<ver>.jar
-    if legacy_versions_dir.exists():
-        for ver_dir in legacy_versions_dir.iterdir():
-            if not ver_dir.is_dir():
-                continue
-            version_id = ver_dir.name
-            jar = ver_dir / f"{version_id}.jar"
-            if not jar.exists():
-                continue
-
-            target_dir = GLOBAL_LIBRARIES_DIR / "net" / "minecraft" / "client" / version_id
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / f"{version_id}.jar"
-
-            if not target.exists():
-                try:
-                    shutil.move(str(jar), str(target))
-                except OSError:
-                    try:
-                        shutil.copy2(jar, target)
-                    except OSError:
-                        pass
-
-        # best-effort cleanup
-        for p in sorted(legacy_versions_dir.rglob("*"), reverse=True):
-            if p.is_dir():
-                try:
-                    p.rmdir()
-                except OSError:
-                    pass
-        try:
-            legacy_versions_dir.rmdir()
-        except OSError:
-            pass
-
-    # Update existing args files that referenced USERDIR/global/{libraries,assets,versions}.
-    legacy_libs_str = str(legacy_libs.resolve())
-    legacy_assets_str = str(legacy_assets.resolve())
-    legacy_versions_str = str((legacy_root / "versions").resolve())
-
-    new_libs_str = str(GLOBAL_LIBRARIES_DIR.resolve())
-    new_assets_str = str(GLOBAL_ASSETS_DIR.resolve())
-
-    if VANILLA_DIR.exists():
-        for p in VANILLA_DIR.glob("java_args_*.txt"):
-            try:
-                content = p.read_text(encoding="utf-8")
-            except OSError:
-                continue
-
-            updated = (
-                content
-                .replace(legacy_libs_str, new_libs_str)
-                .replace(legacy_assets_str, new_assets_str)
-                .replace(legacy_versions_str, new_libs_str)
-            )
-            if updated != content:
-                try:
-                    p.write_text(updated, encoding="utf-8")
-                except OSError:
-                    pass
-
-    # Remove legacy_root completely (it should be empty after migrations above).
     try:
         shutil.rmtree(legacy_root)
     except OSError:
         pass
 
 
-# --------------------------------------------------------------------------------------
-# Instance metadata (instance.json)
-# --------------------------------------------------------------------------------------
-
-def instance_json_path_for_modpack(mp_dir: Path) -> Path:
-    return mp_dir / "instance.json"
-
-
-def load_instance_json(mp_dir: Path) -> Optional[dict]:
-    path = instance_json_path_for_modpack(mp_dir)
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def save_instance_json(mp_dir: Path, data: dict):
-    path = instance_json_path_for_modpack(mp_dir)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-def get_instance_minecraft_version(instance: Optional[dict]) -> Optional[str]:
-    if not instance:
-        return None
-
-    launcher = instance.get("launcher") or {}
-
-    # Prefer CurseForge file data when present
-    curse_file = launcher.get("curseForgeFile") or {}
-    for v in (curse_file.get("gameVersions") or []):
-        if isinstance(v, str) and v and v[0].isdigit():
-            return v
-
-    # Fall back to loaderVersion rawVersion like "1.20.1-47.3.11"
-    lv = launcher.get("loaderVersion") or {}
-    raw = lv.get("rawVersion")
-    if isinstance(raw, str) and raw:
-        return raw.split("-")[0]
-
-    return None
-
-
-def normalize_loader_name(loader: str) -> str:
-    loader = (loader or "").strip().lower()
-    if loader in {"minecraftforge", "forge"}:
-        return "forge"
-    if loader in {"neoforge", "neo"}:
-        return "neoforge"
-    if loader in {"fabric"}:
-        return "fabric"
-    if loader in {"quilt"}:
-        return "quilt"
-    return loader
-
-
-def get_instance_loader(instance: Optional[dict]) -> Optional[str]:
-    if not instance:
-        return None
-    lv = ((instance.get("launcher") or {}).get("loaderVersion") or {})
-    t = lv.get("type")
-    if isinstance(t, str) and t:
-        return normalize_loader_name(t)
-    return None
-
-
-def infer_minecraft_version_from_args_filename(args_file_name: str) -> Optional[str]:
-    import re
-
-    m = re.search(r"java_args_(\d+\.\d+(?:\.\d+)?).txt", args_file_name or "")
-    if not m:
-        return None
-    return m.group(1)
-
-
-def create_default_instance_json(mp_dir: Path, name: str) -> dict:
-    return {
-        "uuid": str(uuid.uuid4()),
-        "launcher": {
-            "name": name,
-            "pack": name,
-            "description": "",
-            "packId": 0,
-            "externalPackId": 0,
-            "version": "1.0.0",
-            "enableCurseForgeIntegration": False,
-            "enableEditingMods": True,
-            "loaderVersion": {
-                "version": "",
-                "rawVersion": "",
-                "recommended": False,
-                "type": "Forge",
-                "downloadables": {},
-            },
-            "requiredMemory": 0,
-            "requiredPermGen": 0,
-            "maximumMemory": 4096,
-            "additionalJvmArgs": DEFAULT_JAVA_PARAMETERS,
-            "quickPlay": {},
-            "isDev": False,
-            "isPlayable": True,
-            "assetsMapToResources": False,
-            "checkForUpdates": True,
-            "overridePaths": [],
-            "mods": [],
-        },
-    }
-
-
-# --------------------------------------------------------------------------------------
-# Java runtime management
-# --------------------------------------------------------------------------------------
-
 def get_java_runtime_dir() -> Path:
     return INSTALL_DIR / JAVA_RUNTIME_DIR_NAME
 
 
 def get_java_executable() -> Path:
-    """Path to the bundled javaw.exe (Windows)."""
     if sys.platform.startswith("win"):
         return get_java_runtime_dir() / "bin" / "javaw.exe"
     return Path("java")
@@ -664,6 +309,7 @@ def read_local_java_runtime_version(config) -> str:
 def write_local_java_runtime_version(config, version: str):
     config["java_runtime_version"] = version
     save_config(config)
+
     version_file = get_java_runtime_dir() / JAVA_RUNTIME_VERSION_FILE
     try:
         version_file.parent.mkdir(parents=True, exist_ok=True)
@@ -678,7 +324,6 @@ def extract_zip(zip_path: Path, dest_dir: Path):
 
 
 def ensure_java_runtime(config, logger):
-    """Ensure Java runtime is downloaded and up to date."""
     if not sys.platform.startswith("win"):
         return
 
@@ -689,69 +334,315 @@ def ensure_java_runtime(config, logger):
     if current_local == desired and java_exe.exists():
         return
 
+    logger(f"Downloading Java runtime {desired}...", source="LAUNCHER")
+    java_dir = get_java_runtime_dir()
+    if java_dir.exists():
+        shutil.rmtree(java_dir)
+
+    java_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = INSTALL_DIR / "java-runtime-download.zip"
+
+    download_to_file(JAVA_RUNTIME_ZIP_URL, zip_path)
+    extract_zip(zip_path, java_dir)
+
     try:
-        logger(f"Downloading Java runtime {desired}...")
-        java_dir = get_java_runtime_dir()
-        if java_dir.exists():
-            shutil.rmtree(java_dir)
+        zip_path.unlink()
+    except OSError:
+        pass
 
-        java_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = INSTALL_DIR / "java-runtime-download.zip"
-
-        logger("Downloading Java runtime zip...")
-        download_to_file(JAVA_RUNTIME_ZIP_URL, zip_path)
-
-        logger("Extracting Java runtime...")
-        extract_zip(zip_path, java_dir)
-
+    # Flatten Oracle JDK top-level folder if present
+    children = list(java_dir.iterdir())
+    if len(children) == 1 and children[0].is_dir():
+        inner = children[0]
+        for item in inner.iterdir():
+            target = java_dir / item.name
+            if target.exists():
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            shutil.move(str(item), str(target))
         try:
-            zip_path.unlink()
+            inner.rmdir()
         except OSError:
             pass
 
-        # Flatten Oracle JDK top-level folder if present
-        children = list(java_dir.iterdir())
-        if len(children) == 1 and children[0].is_dir():
-            inner = children[0]
-            for item in inner.iterdir():
-                target = java_dir / item.name
-                if target.exists():
-                    if target.is_dir():
-                        shutil.rmtree(target)
-                    else:
-                        target.unlink()
-                shutil.move(str(item), str(target))
-            try:
-                inner.rmdir()
-            except OSError:
-                pass
+    write_local_java_runtime_version(config, desired)
+    logger(f"Java runtime {desired} ready.", source="LAUNCHER")
 
-        write_local_java_runtime_version(config, desired)
-        logger(f"Java runtime {desired} ready.")
 
-    except urllib.error.URLError as e:
-        logger(f"Failed to download Java runtime: {e}")
-        messagebox.showerror(
-            "Java download error",
-            f"Could not download Java runtime.\n\n{e}",
+def fetch_version_manifest(logger=None) -> dict:
+    ensure_configs_layout()
+
+    if MINECRAFT_VERSIONS_JSON_FILE.exists():
+        try:
+            return json.loads(MINECRAFT_VERSIONS_JSON_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if logger:
+        logger("Fetching Mojang version manifest...", source="LAUNCHER")
+    with urllib.request.urlopen(VERSION_MANIFEST_URL) as resp:
+        manifest = json.loads(resp.read().decode("utf-8"))
+
+    try:
+        MINECRAFT_VERSIONS_JSON_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+    return manifest
+
+
+def find_version_in_manifest(manifest: dict, version_id: str) -> Optional[dict]:
+    for v in manifest.get("versions", []):
+        if v.get("id") == version_id:
+            return v
+    return None
+
+
+def download_vanilla_version(version_id: str, config: dict, logger) -> Path:
+    manifest = fetch_version_manifest(logger)
+    v_entry = find_version_in_manifest(manifest, version_id)
+    if not v_entry:
+        raise RuntimeError(f"Version {version_id} not found in Mojang manifest.")
+
+    with urllib.request.urlopen(v_entry["url"]) as resp:
+        version_data = json.loads(resp.read().decode("utf-8"))
+
+    ensure_configs_layout()
+    mc_json_path = CONFIGS_JSON_MINECRAFT_DIR / f"{version_id}.json"
+    try:
+        mc_json_path.write_text(json.dumps(version_data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+    version_root = VANILLA_DIR / version_id
+    versions_dir = version_root / "versions" / version_id
+    versions_dir.mkdir(parents=True, exist_ok=True)
+
+    LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    client_url = version_data["downloads"]["client"]["url"]
+    client_jar_path = versions_dir / f"{version_id}.jar"
+    if not client_jar_path.exists():
+        logger(f"Downloading client JAR for {version_id}...", source="LAUNCHER")
+        download_to_file(client_url, client_jar_path)
+
+    download_tasks = []
+    for lib in version_data.get("libraries", []):
+        artifact = (lib.get("downloads") or {}).get("artifact")
+        if not artifact:
+            continue
+        rel_path = artifact.get("path")
+        url = artifact.get("url")
+        if not rel_path or not url:
+            continue
+        target = LIBRARIES_DIR / Path(rel_path)
+        if target.exists():
+            continue
+        download_tasks.append((url, target, f"library {Path(rel_path).name}"))
+
+    if download_tasks:
+        parallel_download_files(download_tasks, logger)
+
+    asset_index_info = version_data.get("assetIndex")
+    if asset_index_info:
+        asset_index_url = asset_index_info["url"]
+        logger(f"Downloading asset index for {version_id}...", source="LAUNCHER")
+        with urllib.request.urlopen(asset_index_url) as resp:
+            asset_index = json.loads(resp.read().decode("utf-8"))
+
+        (ASSETS_DIR / "indexes").mkdir(parents=True, exist_ok=True)
+        (ASSETS_DIR / "indexes" / f"{asset_index_info['id']}.json").write_text(
+            json.dumps(asset_index, indent=2), encoding="utf-8"
         )
-    except Exception as e:
-        logger(f"Failed to prepare Java runtime: {e}")
-        messagebox.showerror(
-            "Java error",
-            f"Failed to prepare Java runtime.\n\n{e}",
-        )
+
+        objects_dir = ASSETS_DIR / "objects"
+        objects_dir.mkdir(parents=True, exist_ok=True)
+
+        download_tasks = []
+        for name, obj in (asset_index.get("objects") or {}).items():
+            hash_ = obj["hash"]
+            prefix = hash_[:2]
+            url = f"{ASSET_BASE_URL}/{prefix}/{hash_}"
+            target = objects_dir / prefix / hash_
+            if target.exists():
+                continue
+            download_tasks.append((url, target, f"asset {name}"))
+
+        if download_tasks:
+            parallel_download_files(download_tasks, logger)
+
+    args_file = generate_java_args_from_version_json(version_id, version_data, config)
+    logger(f"Downloaded vanilla {version_id}. Args file: {args_file.name}", source="LAUNCHER")
+    return args_file
 
 
-# --------------------------------------------------------------------------------------
-# CurseForge / Modrinth import helpers (modpacks)
-# --------------------------------------------------------------------------------------
+def generate_java_args_from_version_json(version_id: str, version_data: dict, config: dict) -> Path:
+    jvm_args = []
+    game_args = []
+
+    arguments = version_data.get("arguments")
+    if arguments:
+        for item in arguments.get("jvm", []):
+            if isinstance(item, str):
+                jvm_args.append(item)
+        for item in arguments.get("game", []):
+            if isinstance(item, str):
+                game_args.append(item)
+    else:
+        legacy_args = version_data.get("minecraftArguments", "")
+        if legacy_args:
+            game_args.extend(legacy_args.split())
+
+    cp_entries = []
+    seen = set()
+
+    for lib in version_data.get("libraries", []):
+        artifact = (lib.get("downloads") or {}).get("artifact")
+        if not artifact:
+            continue
+        rel_path = artifact.get("path")
+        if not rel_path:
+            continue
+        jar_path = str((LIBRARIES_DIR / Path(rel_path)).resolve())
+        if jar_path in seen:
+            continue
+        seen.add(jar_path)
+        cp_entries.append(jar_path)
+
+    client_jar = VANILLA_DIR / version_id / "versions" / version_id / f"{version_id}.jar"
+    if client_jar.exists():
+        cp_entries.append(str(client_jar.resolve()))
+
+    classpath = ";".join(cp_entries) if sys.platform.startswith("win") else ":".join(cp_entries)
+    jvm_args.extend(["-cp", classpath])
+
+    main_class = version_data.get("mainClass", "net.minecraft.client.main.Main")
+
+    game_dir = config.get("minecraft_dir") or str((INSTALL_DIR / "instances" / version_id).resolve())
+    assets_root = str(ASSETS_DIR.resolve())
+    assets_index_name = (version_data.get("assetIndex") or {}).get("id", "assets")
+
+    substitutions = {
+        "${auth_player_name}": config.get("auth_player_name", "Player"),
+        "${version_name}": version_id,
+        "${game_directory}": game_dir,
+        "${assets_root}": assets_root,
+        "${assets_index_name}": assets_index_name,
+        "${auth_uuid}": config.get("auth_uuid", "00000000-0000-0000-0000-000000000000"),
+        "${auth_access_token}": config.get("auth_access_token", "0"),
+        "${user_type}": config.get("user_type", "mojang"),
+        "${version_type}": config.get("version_type", "release"),
+        "${clientid}": "0",
+        "${auth_xuid}": "",
+    }
+
+    def apply_substitutions(arg: str) -> str:
+        for key, value in substitutions.items():
+            arg = arg.replace(key, str(value))
+        return arg
+
+    game_args = [apply_substitutions(a) for a in game_args]
+
+    args_lines = []
+    args_lines.extend(jvm_args)
+    args_lines.append(main_class)
+    args_lines.extend(game_args)
+
+    VANILLA_DIR.mkdir(parents=True, exist_ok=True)
+    args_file = VANILLA_DIR / f"java_args_{version_id}.txt"
+    args_file.write_text("\n".join(args_lines), encoding="utf-8")
+    return args_file
+
+
+def instance_json_path_for_modpack(mp_dir: Path) -> Path:
+    return mp_dir / "instance.json"
+
+
+def load_instance_json(mp_dir: Path) -> Optional[dict]:
+    path = instance_json_path_for_modpack(mp_dir)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_instance_json(mp_dir: Path, data: dict):
+    path = instance_json_path_for_modpack(mp_dir)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def normalize_loader_name(loader: str) -> str:
+    loader = (loader or "").strip().lower()
+    if loader in {"minecraftforge", "forge"}:
+        return "forge"
+    if loader in {"neoforge", "neo"}:
+        return "neoforge"
+    if loader in {"fabric"}:
+        return "fabric"
+    if loader in {"quilt"}:
+        return "quilt"
+    return loader
+
+
+def create_default_instance_json(name: str) -> dict:
+    return {
+        "uuid": str(uuid.uuid4()),
+        "launcher": {
+            "name": name,
+            "pack": name,
+            "description": "",
+            "loaderVersion": {
+                "type": "",
+                "version": "",
+                "rawVersion": "",
+            },
+            "maximumMemory": 4096,
+            "requiredMemory": 0,
+            "additionalJvmArgs": DEFAULT_JAVA_PARAMETERS,
+        },
+    }
+
+
+def get_instance_minecraft_version(instance: Optional[dict]) -> Optional[str]:
+    if not instance:
+        return None
+    launcher = instance.get("launcher") or {}
+
+    curse_file = launcher.get("curseForgeFile") or {}
+    for v in (curse_file.get("gameVersions") or []):
+        if isinstance(v, str) and v and v[0].isdigit():
+            return v
+
+    lv = launcher.get("loaderVersion") or {}
+    raw = lv.get("rawVersion")
+    if isinstance(raw, str) and raw:
+        return raw.split("-")[0]
+
+    return None
+
+
+def get_instance_loader(instance: Optional[dict]) -> Optional[str]:
+    if not instance:
+        return None
+    lv = ((instance.get("launcher") or {}).get("loaderVersion") or {})
+    t = lv.get("type")
+    if isinstance(t, str) and t:
+        return normalize_loader_name(t)
+    return None
+
+
+def infer_minecraft_version_from_args_filename(args_file_name: str) -> Optional[str]:
+    import re
+
+    m = re.search(r"java_args_(\d+\.\d+(?:\.\d+)?).txt", args_file_name or "")
+    if not m:
+        return None
+    return m.group(1)
+
 
 def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path) -> Optional[dict]:
-    """Import a CurseForge modpack zip: extract overrides/ into the modpack.
-
-    Returns the parsed manifest.json dict if present.
-    """
     manifest = None
 
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -780,7 +671,6 @@ def import_curseforge_modpack(zip_path: Path, dest_modpack_dir: Path) -> Optiona
 
 
 def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
-    """Import a Modrinth .mrpack into the modpack folder."""
     with zipfile.ZipFile(zip_path, "r") as zf:
         namelist = zf.namelist()
 
@@ -819,250 +709,8 @@ def import_modrinth_modpack(zip_path: Path, dest_modpack_dir: Path, logger):
                 with zf.open(name) as src, open(target, "wb") as out_f:
                     shutil.copyfileobj(src, out_f)
 
+        return index
 
-# --------------------------------------------------------------------------------------
-# Vanilla version download via Mojang (generic)
-# --------------------------------------------------------------------------------------
-
-def fetch_version_manifest():
-    with urllib.request.urlopen(VERSION_MANIFEST_URL) as resp:
-        manifest = json.loads(resp.read().decode("utf-8"))
-
-    # Mirror ATLauncher-style cached manifest name.
-    ensure_configs_layout()
-    try:
-        MINECRAFT_VERSIONS_JSON_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-    return manifest
-
-
-def find_version_in_manifest(manifest, version_id: str):
-    versions = manifest.get("versions", [])
-    for v in versions:
-        if v.get("id") == version_id:
-            return v
-    return None
-
-
-def download_vanilla_version(version_id: str, config, logger) -> Path:
-    """Download vanilla client + libs + assets; generate java_args_<version>.txt.
-
-    Uses shared libraries/assets folders so all versions can reuse them.
-    """
-    logger(f"Fetching manifest for version {version_id}...")
-    manifest = fetch_version_manifest()
-    v_entry = find_version_in_manifest(manifest, version_id)
-    if not v_entry:
-        raise RuntimeError(f"Version {version_id} not found in Mojang manifest.")
-
-    version_url = v_entry["url"]
-    logger(f"Downloading version JSON for {version_id}...")
-    with urllib.request.urlopen(version_url) as resp:
-        version_data = json.loads(resp.read().decode("utf-8"))
-
-    # Version JSON files are stored like ATLauncher:
-    #   USERDIR/configs/json/minecraft/<version>.json
-    # We still keep USERDIR/vanilla/<version>/ for legacy migration helpers.
-    version_root = VANILLA_DIR / version_id
-    version_root.mkdir(parents=True, exist_ok=True)
-
-    ensure_configs_layout()
-    try:
-        mc_json_path = CONFIGS_JSON_MINECRAFT_DIR / f"{version_id}.json"
-        mc_json_path.write_text(json.dumps(version_data, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-    GLOBAL_LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
-    GLOBAL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Store the vanilla client jar in the shared libraries folder in a Maven-like layout:
-    #   USERDIR/libraries/net/minecraft/client/<mcVersion>/<mcVersion>.jar
-    client_dir = GLOBAL_LIBRARIES_DIR / "net" / "minecraft" / "client" / version_id
-    client_dir.mkdir(parents=True, exist_ok=True)
-
-    client_download = version_data["downloads"]["client"]
-    client_url = client_download["url"]
-    client_jar_path = client_dir / f"{version_id}.jar"
-
-    # Migrate legacy per-version client jar if present.
-    legacy_client_jar = version_root / "versions" / version_id / f"{version_id}.jar"
-    if not client_jar_path.exists() and legacy_client_jar.exists():
-        try:
-            shutil.copy2(legacy_client_jar, client_jar_path)
-        except OSError:
-            pass
-
-    if not client_jar_path.exists():
-        logger(f"Downloading client JAR for {version_id}...")
-        download_to_file(client_url, client_jar_path)
-
-    libraries = version_data.get("libraries", [])
-    download_tasks = []
-
-    for lib in libraries:
-        downloads = lib.get("downloads", {})
-        artifact = downloads.get("artifact")
-        if not artifact:
-            continue
-        path = artifact.get("path")
-        url = artifact.get("url")
-        if not path or not url:
-            continue
-        target = GLOBAL_LIBRARIES_DIR / Path(path)
-        if target.exists():
-            continue
-        download_tasks.append((url, target, f"library {Path(path).name}"))
-
-    if download_tasks:
-        parallel_download_files(download_tasks, logger)
-
-    asset_index_info = version_data.get("assetIndex")
-    if asset_index_info:
-        asset_index_url = asset_index_info["url"]
-        logger(f"Downloading asset index for {version_id}...")
-        with urllib.request.urlopen(asset_index_url) as resp:
-            asset_index = json.loads(resp.read().decode("utf-8"))
-
-        (GLOBAL_ASSETS_DIR / "indexes").mkdir(parents=True, exist_ok=True)
-        (GLOBAL_ASSETS_DIR / "indexes" / f"{asset_index_info['id']}.json").write_text(
-            json.dumps(asset_index, indent=2), encoding="utf-8"
-        )
-
-        objects_dir = GLOBAL_ASSETS_DIR / "objects"
-        objects_dir.mkdir(parents=True, exist_ok=True)
-
-        objects = asset_index.get("objects", {})
-        download_tasks = []
-
-        for name, obj in objects.items():
-            hash_ = obj["hash"]
-            prefix = hash_[:2]
-            url = f"{ASSET_BASE_URL}/{prefix}/{hash_}"
-            target = objects_dir / prefix / hash_
-            if target.exists():
-                continue
-            download_tasks.append((url, target, f"asset {name}"))
-
-        if download_tasks:
-            parallel_download_files(download_tasks, logger)
-
-    args_file = generate_java_args_from_version_json(
-        version_id,
-        version_data,
-        GLOBAL_LIBRARIES_DIR,
-        GLOBAL_ASSETS_DIR,
-        config,
-    )
-
-    logger(f"Downloaded vanilla {version_id}. Args file: {args_file}")
-    return args_file
-
-
-def generate_java_args_from_version_json(
-    version_id: str,
-    version_data: dict,
-    libraries_dir: Path,
-    assets_dir: Path,
-    config: dict,
-) -> Path:
-    """Build a java_args_<version>.txt based on Mojang's version JSON.
-
-    Libraries are expected to be stored in a Maven-like directory layout.
-    The vanilla client jar is stored at:
-      USERDIR/libraries/net/minecraft/client/<mcVersion>/<mcVersion>.jar
-    """
-    jvm_args = []
-    game_args = []
-
-    arguments = version_data.get("arguments")
-    if arguments:
-        jvm = arguments.get("jvm", [])
-        game = arguments.get("game", [])
-        for item in jvm:
-            if isinstance(item, str):
-                jvm_args.append(item)
-        for item in game:
-            if isinstance(item, str):
-                game_args.append(item)
-    else:
-        legacy_args = version_data.get("minecraftArguments", "")
-        if legacy_args:
-            game_args.extend(legacy_args.split())
-
-    # Build classpath from the Mojang version manifest so we only include the
-    # libraries required for this specific version.
-    cp_entries = []
-    seen = set()
-
-    for lib in version_data.get("libraries", []):
-        downloads = lib.get("downloads", {})
-        artifact = downloads.get("artifact")
-        if not artifact:
-            continue
-        rel_path = artifact.get("path")
-        if not rel_path:
-            continue
-        jar_path = str(libraries_dir / Path(rel_path))
-        if jar_path in seen:
-            continue
-        seen.add(jar_path)
-        cp_entries.append(jar_path)
-
-    client_jar = libraries_dir / "net" / "minecraft" / "client" / version_id / f"{version_id}.jar"
-    client_jar_str = str(client_jar)
-    if client_jar.exists() and client_jar_str not in seen:
-        cp_entries.append(client_jar_str)
-
-    classpath = ";".join(cp_entries) if sys.platform.startswith("win") else ":".join(cp_entries)
-
-    jvm_args.extend(["-cp", classpath])
-
-    main_class = version_data.get("mainClass", "net.minecraft.client.main.Main")
-
-    game_dir = config.get("minecraft_dir") or str((INSTALL_DIR / "instances" / version_id).resolve())
-    assets_root = str(assets_dir.resolve())
-    assets_index_name = version_data.get("assetIndex", {}).get("id", "assets")
-
-    substitutions = {
-        "${auth_player_name}": config.get("auth_player_name", "Player"),
-        "${version_name}": version_id,
-        "${game_directory}": game_dir,
-        "${assets_root}": assets_root,
-        "${assets_index_name}": assets_index_name,
-        "${auth_uuid}": config.get("auth_uuid", "00000000-0000-0000-0000-000000000000"),
-        "${auth_access_token}": config.get("auth_access_token", "0"),
-        "${user_type}": config.get("user_type", "mojang"),
-        "${version_type}": config.get("version_type", "release"),
-        "${clientid}": "0",
-        "${auth_xuid}": "",
-    }
-
-    def apply_substitutions(arg: str) -> str:
-        for key, value in substitutions.items():
-            arg = arg.replace(key, value)
-        return arg
-
-    game_args = [apply_substitutions(a) for a in game_args]
-
-    args_lines = []
-    for a in jvm_args:
-        args_lines.append(a)
-    args_lines.append(main_class)
-    for a in game_args:
-        args_lines.append(a)
-
-    VANILLA_DIR.mkdir(parents=True, exist_ok=True)
-    args_file = VANILLA_DIR / f"java_args_{version_id}.txt"
-    args_file.write_text("\n".join(args_lines), encoding="utf-8")
-    return args_file
-
-
-# --------------------------------------------------------------------------------------
-# GUI application with console + mod downloads
-# --------------------------------------------------------------------------------------
 
 class MinecraftLauncherApp:
     def __init__(self, root: Tk):
@@ -1081,17 +729,20 @@ class MinecraftLauncherApp:
         self.root.configure(bg=self.bg_color)
 
         self.config = load_config()
+
         ensure_modpacks_dir()
+        VANILLA_DIR.mkdir(parents=True, exist_ok=True)
+        LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
         self.selected_modpack = StringVar()
-        self.status_var = StringVar()
-        self.status_var.set("Starting...")
-
-        self.args_file_var = StringVar()
+        self.status_var = StringVar(value="Starting...")
+        self.args_file_var = StringVar(value="")
 
         self.console_window = None
         self.console_text = None
         self.console_scroll_lock = False
+        self.scroll_lock_btn = None
 
         self._build_ui()
         self._load_modpacks_into_list()
@@ -1099,8 +750,6 @@ class MinecraftLauncherApp:
         self._refresh_args_file_options()
 
         threading.Thread(target=self._background_startup_tasks, daemon=True).start()
-
-    # ----- console logger -----
 
     def log(self, text: str, source: str = "LAUNCHER"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1116,6 +765,154 @@ class MinecraftLauncherApp:
             if not self.console_scroll_lock:
                 self.console_text.see(END)
             self.console_text.config(state=DISABLED)
+
+    def _background_startup_tasks(self):
+        migrate_legacy_global_resources(self.log)
+        ensure_java_runtime(self.config, self.log)
+        self.log("Ready.", source="LAUNCHER")
+
+    def _mk_main_button(self, parent, text, command):
+        btn = Button(
+            parent,
+            text=text,
+            command=command,
+            bg=self.button_color,
+            fg=self.text_color,
+            activebackground=self.button_hover_color,
+            activeforeground=self.text_color,
+            relief="flat",
+            padx=10,
+            pady=3,
+        )
+        return btn
+
+    def _build_ui(self):
+        header = Frame(self.root, bg=self.panel_color, height=60)
+        header.pack(fill="x", side="top")
+
+        title_label = Label(
+            header,
+            text=f"{APP_NAME} v{LAUNCHER_VERSION}",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 16, "bold"),
+        )
+        title_label.pack(side="left", padx=10)
+
+        self._mk_main_button(header, "Set Minecraft Folder", self.choose_minecraft_dir).pack(
+            side="right", padx=10, pady=10
+        )
+
+        main_frame = Frame(self.root, bg=self.bg_color)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        left_frame = Frame(main_frame, bg=self.panel_color, width=260, bd=2)
+        left_frame.pack(side="left", fill="y", padx=(0, 10), pady=0)
+
+        right_frame = Frame(main_frame, bg=self.panel_color, bd=2)
+        right_frame.pack(side="right", fill="both", expand=True, pady=0)
+
+        Label(
+            left_frame,
+            text="Modpacks",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 14, "bold"),
+        ).pack(anchor="w", padx=10, pady=(10, 5))
+
+        listbox_frame = Frame(left_frame, bg=self.panel_color)
+        listbox_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.modpack_listbox = Listbox(
+            listbox_frame,
+            bg="#1f2616",
+            fg=self.text_color,
+            selectbackground=self.button_color,
+            selectforeground=self.text_color,
+            highlightthickness=0,
+            borderwidth=0,
+            activestyle="none",
+            font=("Helvetica", 11),
+            selectmode=SINGLE,
+        )
+        self.modpack_listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = Scrollbar(listbox_frame, command=self.modpack_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.modpack_listbox.config(yscrollcommand=scrollbar.set)
+        self.modpack_listbox.bind("<<ListboxSelect>>", self._on_modpack_selected)
+
+        mp_button_frame = Frame(left_frame, bg=self.panel_color)
+        mp_button_frame.pack(fill="x", padx=10, pady=(5, 10))
+
+        self._mk_main_button(mp_button_frame, "New", self.create_modpack_dialog).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_main_button(mp_button_frame, "Edit", self.edit_modpack_dialog).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_main_button(mp_button_frame, "Imp", self.import_modpack_dialog).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_main_button(mp_button_frame, "Del", self.delete_modpack).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+        details = Frame(right_frame, bg=self.panel_color)
+        details.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.details_label = Label(
+            details,
+            text="Select a modpack",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 13, "bold"),
+            justify="left",
+        )
+        self.details_label.pack(anchor="w")
+
+        Label(
+            details,
+            text="Vanilla args file:",
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+        ).pack(anchor="w", pady=(15, 2))
+
+        self.args_option_menu = OptionMenu(details, self.args_file_var, "")
+        self.args_option_menu.config(
+            bg="#1f2616",
+            fg=self.text_color,
+            activebackground=self.button_hover_color,
+            activeforeground=self.text_color,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.args_option_menu.pack(anchor="w")
+
+        action_row = Frame(details, bg=self.panel_color)
+        action_row.pack(fill="x", pady=(15, 10))
+
+        self._mk_main_button(action_row, "Install Vanilla", self.install_vanilla_version_dialog).pack(
+            side="left", padx=3
+        )
+        self._mk_main_button(action_row, "Console", self.open_console_window).pack(
+            side="left", padx=3
+        )
+        self._mk_main_button(action_row, "Play", self.play).pack(side="right", padx=3)
+
+        footer = Frame(self.root, bg=self.panel_color)
+        footer.pack(fill="x", side="bottom")
+
+        self.status_label = Label(
+            footer,
+            textvariable=self.status_var,
+            bg=self.panel_color,
+            fg=self.text_color,
+            font=("Helvetica", 10),
+            anchor="w",
+        )
+        self.status_label.pack(fill="x", padx=10, pady=6)
 
     def open_console_window(self):
         if self.console_window is not None and self.console_window.winfo_exists():
@@ -1205,7 +1002,6 @@ class MinecraftLauncherApp:
         text_widget.config(yscrollcommand=scroll.set)
 
         self.console_text = text_widget
-
         self.log("Console opened.", source="LAUNCHER")
 
         def on_close():
@@ -1242,257 +1038,15 @@ class MinecraftLauncherApp:
         )
         if not path:
             return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            self.log(f"Console log saved to {path}.")
-        except Exception as e:
-            messagebox.showerror("Save error", f"Could not save log:\n{e}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        self.log(f"Console log saved to {path}.", source="LAUNCHER")
 
     def console_toggle_scroll_lock(self):
         self.console_scroll_lock = not self.console_scroll_lock
         state = "ON" if self.console_scroll_lock else "OFF"
         if self.scroll_lock_btn:
             self.scroll_lock_btn.config(text=f"Scroll Lock: {state}")
-
-    # ----- background tasks -----
-
-    def _background_startup_tasks(self):
-        ensure_configs_layout()
-        GLOBAL_LIBRARIES_DIR.mkdir(parents=True, exist_ok=True)
-        GLOBAL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-        migrate_legacy_global_resources(self.log)
-        migrate_legacy_vanilla_version_resources(self.log)
-        migrate_legacy_args_files(self.log)
-        ensure_java_runtime(self.config, self.log)
-        self.log("Ready.")
-
-    # ----- UI building -----
-
-    def _build_ui(self):
-        header = Frame(self.root, bg=self.panel_color, height=60)
-        header.pack(fill="x", side="top")
-
-        title_label = Label(
-            header,
-            text=f"{APP_NAME} v{LAUNCHER_VERSION}",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 20, "bold"),
-        )
-        title_label.pack(side="left", padx=20, pady=10)
-
-        settings_frame = Frame(header, bg=self.panel_color)
-        settings_frame.pack(side="right", padx=10)
-
-        self._mk_header_button(
-            settings_frame,
-            "Console",
-            self.open_console_window,
-        ).pack(side="left", padx=5)
-
-        self._mk_header_button(
-            settings_frame,
-            "Minecraft Folder",
-            self.choose_minecraft_dir,
-        ).pack(side="left", padx=5)
-
-        self._mk_header_button(
-            settings_frame,
-            "Install Vanilla Version",
-            self.install_vanilla_version_dialog,
-        ).pack(side="left", padx=5)
-
-        main_frame = Frame(self.root, bg=self.bg_color)
-        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-        left_frame = Frame(main_frame, bg=self.panel_color, bd=2)
-        left_frame.pack(side="left", fill="y", padx=(0, 10), pady=0)
-
-        right_frame = Frame(main_frame, bg=self.panel_color, bd=2)
-        right_frame.pack(side="right", fill="both", expand=True, pady=0)
-
-        list_label = Label(
-            left_frame,
-            text="Modpacks",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 14, "bold"),
-        )
-        list_label.pack(anchor="w", padx=10, pady=(10, 5))
-
-        listbox_frame = Frame(left_frame, bg=self.panel_color)
-        listbox_frame.pack(fill="both", expand=True, padx=10, pady=5)
-
-        self.modpack_listbox = Listbox(
-            listbox_frame,
-            bg="#1f2616",
-            fg=self.text_color,
-            selectbackground=self.button_color,
-            selectforeground=self.text_color,
-            highlightthickness=0,
-            borderwidth=0,
-            activestyle="none",
-            font=("Helvetica", 11),
-            selectmode=SINGLE,
-        )
-        self.modpack_listbox.pack(side="left", fill="both", expand=True)
-
-        scrollbar = Scrollbar(listbox_frame, command=self.modpack_listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.modpack_listbox.config(yscrollcommand=scrollbar.set)
-        self.modpack_listbox.bind("<<ListboxSelect>>", self._on_modpack_selected)
-
-        mp_button_frame = Frame(left_frame, bg=self.panel_color)
-        mp_button_frame.pack(fill="x", padx=10, pady=(5, 10))
-
-        self._mk_main_button(mp_button_frame, "New", self.create_modpack_dialog).pack(
-            side="left", expand=True, fill="x", padx=2
-        )
-        self._mk_main_button(mp_button_frame, "Edit", self.edit_modpack_dialog).pack(
-            side="left", expand=True, fill="x", padx=2
-        )
-        self._mk_main_button(
-            mp_button_frame, "Delete", self.delete_modpack
-        ).pack(side="left", expand=True, fill="x", padx=2)
-        self._mk_main_button(
-            mp_button_frame, "Import", self.import_modpack_dialog
-        ).pack(side="left", expand=True, fill="x", padx=2)
-
-        detail_top = Frame(right_frame, bg=self.panel_color)
-        detail_top.pack(fill="x", padx=10, pady=(10, 5))
-
-        self.detail_title = Label(
-            detail_top,
-            text="No modpack selected",
-            bg=self.panel_color,
-            fg=self.accent_color,
-            font=("Helvetica", 16, "bold"),
-        )
-        self.detail_title.pack(anchor="w")
-
-        self.detail_info = Label(
-            right_frame,
-            text="Create or select a modpack to get started.",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-            justify="left",
-        )
-        self.detail_info.pack(fill="both", expand=True, padx=10, pady=5)
-
-        bottom_right = Frame(right_frame, bg=self.panel_color)
-        bottom_right.pack(fill="x", padx=10, pady=(5, 10))
-
-        args_label = Label(
-            bottom_right,
-            text="Args file (USERDIR/vanilla):",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 10),
-        )
-        args_label.pack(side="left", padx=(0, 5))
-
-        self.args_menu = OptionMenu(bottom_right, self.args_file_var, "")
-        self.args_menu.config(
-            bg="#4d5c32",
-            fg=self.text_color,
-            activebackground=self.button_hover_color,
-            activeforeground=self.text_color,
-            relief="flat",
-            highlightthickness=0,
-        )
-        self.args_menu["menu"].config(bg="#4d5c32", fg=self.text_color)
-        self.args_menu.pack(side="left", padx=(0, 10))
-
-        self.play_button = self._mk_big_play_button(bottom_right, "PLAY", self.play)
-        self.play_button.pack(side="right", padx=5)
-
-        status_bar = Frame(self.root, bg="#1c2413", height=24)
-        status_bar.pack(fill="x", side="bottom")
-
-        self.status_label = Label(
-            status_bar,
-            textvariable=self.status_var,
-            bg="#1c2413",
-            fg=self.text_color,
-            font=("Helvetica", 10),
-            anchor="w",
-        )
-        self.status_label.pack(fill="x", padx=10)
-
-    def _mk_header_button(self, parent, text, command):
-        return Button(
-            parent,
-            text=text,
-            command=command,
-            bg="#4d5c32",
-            fg=self.text_color,
-            activebackground=self.button_hover_color,
-            activeforeground=self.text_color,
-            relief="flat",
-            padx=10,
-            pady=5,
-            font=("Helvetica", 9, "bold"),
-        )
-
-    def _mk_main_button(self, parent, text, command):
-        return Button(
-            parent,
-            text=text,
-            command=command,
-            bg=self.button_color,
-            fg=self.text_color,
-            activebackground=self.button_hover_color,
-            activeforeground=self.text_color,
-            relief="flat",
-            padx=8,
-            pady=5,
-            font=("Helvetica", 10),
-        )
-
-    def _mk_big_play_button(self, parent, text, command):
-        return Button(
-            parent,
-            text=text,
-            command=command,
-            bg="#6eb134",
-            fg="#1b250e",
-            activebackground="#8ad44a",
-            activeforeground="#1b250e",
-            relief="flat",
-            padx=25,
-            pady=12,
-            font=("Helvetica", 14),
-        )
-
-    # ----- Args file discovery -----
-
-    def _refresh_args_file_options(self):
-        options = []
-
-        if VANILLA_DIR.exists():
-            for p in sorted(VANILLA_DIR.glob("java_args_*.txt")):
-                options.append(p.name)
-
-        if not options:
-            options = ["<no args files in USERDIR/vanilla>"]
-
-        menu = self.args_menu["menu"]
-        menu.delete(0, "end")
-        for opt in options:
-            menu.add_command(
-                label=opt,
-                command=lambda v=opt: self._on_select_args_file(v),
-            )
-
-        self.args_file_var.set(options[0])
-
-    def _on_select_args_file(self, value):
-        self.args_file_var.set(value)
-        self.log(f"Using args file: USERDIR/vanilla/{value}")
-
-    # ----- Modpack handling -----
 
     def _load_modpacks_into_list(self):
         self.modpack_listbox.delete(0, END)
@@ -1503,82 +1057,77 @@ class MinecraftLauncherApp:
         last = self.config.get("last_selected_modpack") or ""
         if not last:
             return
-        for idx in range(self.modpack_listbox.size()):
-            if self.modpack_listbox.get(idx) == last:
-                self.modpack_listbox.selection_set(idx)
-                self.modpack_listbox.activate(idx)
-                self._update_detail_panel(last)
-                break
-
-    def _on_modpack_selected(self, event=None):
-        idxs = self.modpack_listbox.curselection()
-        if not idxs:
-            self.selected_modpack.set("")
-            self._update_detail_panel(None)
+        names = list_modpacks()
+        if last not in names:
             return
-        name = self.modpack_listbox.get(idxs[0])
+        idx = names.index(last)
+        self.modpack_listbox.selection_set(idx)
+        self.modpack_listbox.see(idx)
+        self.selected_modpack.set(last)
+        self._update_details()
+
+    def _on_modpack_selected(self, _evt=None):
+        sel = self.modpack_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        name = self.modpack_listbox.get(idx)
         self.selected_modpack.set(name)
         self.config["last_selected_modpack"] = name
         save_config(self.config)
-        self._update_detail_panel(name)
+        self._update_details()
 
-    def _update_detail_panel(self, modpack_name):
-        if not modpack_name:
-            self.detail_title.config(text="No modpack selected")
-            self.detail_info.config(
-                text="Create or select a modpack to get started."
-            )
+    def _update_details(self):
+        name = self.selected_modpack.get() or ""
+        if not name:
+            self.details_label.config(text="Select a modpack")
             return
 
-        mp_dir = Path(MODPACKS_DIR) / modpack_name
-        mods_dir = mp_dir / "mods"
-        config_dir = mp_dir / "config"
-        resource_dir = mp_dir / "resourcepacks"
+        mp_dir = MODPACKS_DIR / name
+        inst = load_instance_json(mp_dir)
+        mc_ver = get_instance_minecraft_version(inst)
+        loader = get_instance_loader(inst)
 
-        instance = load_instance_json(mp_dir)
-        if instance is None:
-            instance = create_default_instance_json(mp_dir, modpack_name)
-            save_instance_json(mp_dir, instance)
+        extra = []
+        if mc_ver:
+            extra.append(f"Minecraft: {mc_ver}")
+        if loader:
+            extra.append(f"Loader: {loader}")
 
-        mods_count = (
-            sum(1 for _ in mods_dir.rglob("*") if _.is_file())
-            if mods_dir.exists()
-            else 0
+        suffix = ("\n" + "\n".join(extra)) if extra else ""
+        self.details_label.config(text=f"{name}{suffix}")
+
+    def _refresh_args_file_options(self):
+        VANILLA_DIR.mkdir(parents=True, exist_ok=True)
+        args_files = sorted([p.name for p in VANILLA_DIR.glob("java_args_*.txt")])
+
+        menu = self.args_option_menu["menu"]
+        menu.delete(0, "end")
+
+        if not args_files:
+            self.args_file_var.set("<no args files>")
+            menu.add_command(label="<no args files>", command=lambda: self._on_select_args_file("<no args files>"))
+            return
+
+        current = self.args_file_var.get()
+        if current not in args_files:
+            self.args_file_var.set(args_files[0])
+
+        for name in args_files:
+            menu.add_command(label=name, command=lambda v=name: self._on_select_args_file(v))
+
+    def _on_select_args_file(self, name: str):
+        self.args_file_var.set(name)
+
+    def choose_minecraft_dir(self):
+        directory = filedialog.askdirectory(
+            title="Select your .minecraft folder or instance folder",
         )
-        config_count = (
-            sum(1 for _ in config_dir.rglob("*") if _.is_file())
-            if config_dir.exists()
-            else 0
-        )
-        resource_count = (
-            sum(1 for _ in resource_dir.rglob("*") if _.is_file())
-            if resource_dir.exists()
-            else 0
-        )
-
-        java_exec = get_java_executable()
-        args_file = self.args_file_var.get()
-
-        inst_mc = get_instance_minecraft_version(instance) or "<unknown>"
-        inst_loader = get_instance_loader(instance) or "<unknown>"
-
-        info = [
-            f"Folder: {mp_dir}",
-            "",
-            f"Minecraft: {inst_mc}",
-            f"Loader: {inst_loader}",
-            "",
-            f"Mods: {mods_count}",
-            f"Config files: {config_count}",
-            f"Resource packs: {resource_count}",
-            "",
-            f"Java: {java_exec} (expected {JAVA_RUNTIME_VERSION})",
-            f"Args file: USERDIR/vanilla/{args_file}",
-            "",
-            "Tip: Use Edit -> Instance Settings to set Minecraft version/loader.",
-        ]
-        self.detail_title.config(text=modpack_name)
-        self.detail_info.config(text="\n".join(info))
+        if not directory:
+            return
+        self.config["minecraft_dir"] = directory
+        save_config(self.config)
+        self.log(f"Minecraft directory set to: {directory}", source="LAUNCHER")
 
     def create_modpack_dialog(self):
         dialog = Toplevel(self.root)
@@ -1587,451 +1136,57 @@ class MinecraftLauncherApp:
         dialog.grab_set()
         dialog.resizable(False, False)
 
-        Label(
-            dialog,
-            text="Modpack Name:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(10, 3), anchor="w")
+        Label(dialog, text="Modpack name:", bg=self.panel_color, fg=self.text_color).pack(
+            padx=10, pady=(10, 3), anchor="w"
+        )
 
-        name_var = StringVar()
-        entry = Entry(
+        name_var = StringVar(value="")
+        Entry(
             dialog,
             textvariable=name_var,
             bg="#1f2616",
             fg=self.text_color,
             insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-        )
-        entry.pack(padx=10, pady=3, fill="x")
-        entry.focus_set()
+        ).pack(padx=10, pady=3, fill="x")
 
         def on_create():
             name = name_var.get().strip()
             if not name:
                 messagebox.showwarning("Invalid name", "Please enter a modpack name.")
                 return
-            safe_name = "".join(c for c in name if c not in "\\/:*?\"<>|")
-            if not safe_name:
-                messagebox.showwarning(
-                    "Invalid name",
-                    "Name contains only invalid characters.",
-                )
-                return
-            mp_dir = Path(MODPACKS_DIR) / safe_name
+            mp_dir = MODPACKS_DIR / name
             if mp_dir.exists():
-                messagebox.showerror(
-                    "Already exists", f"A modpack named '{safe_name}' already exists."
-                )
+                messagebox.showerror("Exists", "A modpack with that name already exists.")
                 return
+
             (mp_dir / "mods").mkdir(parents=True, exist_ok=True)
             (mp_dir / "config").mkdir(parents=True, exist_ok=True)
             (mp_dir / "resourcepacks").mkdir(parents=True, exist_ok=True)
 
-            save_instance_json(mp_dir, create_default_instance_json(mp_dir, safe_name))
+            save_instance_json(mp_dir, create_default_instance_json(name))
 
-            self._load_modpacks_into_list()
-            for idx in range(self.modpack_listbox.size()):
-                if self.modpack_listbox.get(idx) == safe_name:
-                    self.modpack_listbox.selection_clear(0, END)
-                    self.modpack_listbox.selection_set(idx)
-                    self.modpack_listbox.activate(idx)
-                    self._on_modpack_selected()
-                    break
             dialog.destroy()
-            self.log(f"Created modpack '{safe_name}'.")
-
-        btn_frame = Frame(dialog, bg=self.panel_color)
-        btn_frame.pack(padx=10, pady=10, fill="x")
-
-        self._mk_main_button(btn_frame, "Create", on_create).pack(
-            side="right", padx=5
-        )
-        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(
-            side="right", padx=5
-        )
-
-    def edit_modpack_dialog(self):
-        name = self.selected_modpack.get()
-        if not name:
-            messagebox.showinfo("No selection", "Please select a modpack first.")
-            return
-
-        mp_dir = Path(MODPACKS_DIR) / name
-        if not mp_dir.exists():
-            messagebox.showerror(
-                "Missing folder",
-                f"The folder for '{name}' is missing.\nExpected: {mp_dir}",
-            )
-            return
-
-        dialog = Toplevel(self.root)
-        dialog.title(f"Edit Modpack - {name}")
-        dialog.configure(bg=self.panel_color)
-        dialog.grab_set()
-        dialog.resizable(True, True)
-
-        Label(
-            dialog,
-            text="Modpack Name:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(10, 3), anchor="w")
-
-        name_var = StringVar(value=name)
-        entry = Entry(
-            dialog,
-            textvariable=name_var,
-            bg="#1f2616",
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-        )
-        entry.pack(padx=10, pady=3, fill="x")
-
-        def open_folder(sub):
-            target = mp_dir / sub
-            target.mkdir(parents=True, exist_ok=True)
-            path_str = str(target.resolve())
-            if sys.platform.startswith("win"):
-                os.startfile(path_str)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", path_str])
-            else:
-                subprocess.Popen(["xdg-open", path_str])
-
-        Label(
-            dialog,
-            text="Open folders for this modpack:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(8, 3), anchor="w")
-
-        folder_frame = Frame(dialog, bg=self.panel_color)
-        folder_frame.pack(padx=10, pady=3, fill="x")
-
-        self._mk_main_button(
-            folder_frame, "mods", lambda: open_folder("mods")
-        ).pack(side="left", padx=3)
-        self._mk_main_button(
-            folder_frame, "config", lambda: open_folder("config")
-        ).pack(side="left", padx=3)
-        self._mk_main_button(
-            folder_frame, "resourcepacks", lambda: open_folder("resourcepacks")
-        ).pack(side="left", padx=3)
-
-        add_mod_frame = Frame(dialog, bg=self.panel_color)
-        add_mod_frame.pack(padx=10, pady=(5, 3), fill="x")
-
-        self._mk_main_button(
-            add_mod_frame,
-            "Add Mod (CF/Modrinth)",
-            lambda: self.add_mod_to_modpack_dialog(mp_dir),
-        ).pack(side="left", padx=3)
-
-        # Instance settings
-        instance = load_instance_json(mp_dir)
-        if instance is None:
-            instance = create_default_instance_json(mp_dir, name)
-            save_instance_json(mp_dir, instance)
-
-        inst_loader = (get_instance_loader(instance) or "forge").lower()
-        inst_mc = get_instance_minecraft_version(instance) or ""
-        launcher_cfg = instance.get("launcher") or {}
-        inst_max_mem = str((launcher_cfg.get("maximumMemory") or 4096))
-        inst_min_mem = str((launcher_cfg.get("requiredMemory") or 0))
-        inst_extra_jvm = launcher_cfg.get("additionalJvmArgs") or ""
-        if not isinstance(inst_extra_jvm, str):
-            inst_extra_jvm = ""
-
-        Label(
-            dialog,
-            text="Instance Settings (used for Modrinth/CurseForge filtering):",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(10, 3), anchor="w")
-
-        settings_frame = Frame(dialog, bg=self.panel_color)
-        settings_frame.pack(padx=10, pady=3, fill="x")
-
-        Label(
-            settings_frame,
-            text="Minecraft version:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 10),
-        ).grid(row=0, column=0, sticky="w")
-
-        mc_var = StringVar(value=inst_mc)
-        mc_entry = Entry(
-            settings_frame,
-            textvariable=mc_var,
-            bg="#1f2616",
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-            width=18,
-        )
-        mc_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
-
-        Label(
-            settings_frame,
-            text="Loader:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 10),
-        ).grid(row=0, column=2, sticky="w")
-
-        loader_var = StringVar(value=inst_loader)
-        loader_menu = OptionMenu(settings_frame, loader_var, "forge", "fabric", "quilt", "neoforge")
-        loader_menu.config(
-            bg="#4d5c32",
-            fg=self.text_color,
-            activebackground=self.button_hover_color,
-            activeforeground=self.text_color,
-            relief="flat",
-            highlightthickness=0,
-        )
-        loader_menu["menu"].config(bg="#4d5c32", fg=self.text_color)
-        loader_menu.grid(row=0, column=3, sticky="w", padx=(6, 12))
-
-        Label(
-            settings_frame,
-            text="Max memory (MB):",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 10),
-        ).grid(row=0, column=4, sticky="w")
-
-        mem_var = StringVar(value=inst_max_mem)
-        mem_entry = Entry(
-            settings_frame,
-            textvariable=mem_var,
-            bg="#1f2616",
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-            width=10,
-        )
-        mem_entry.grid(row=0, column=5, sticky="w", padx=(6, 0))
-
-        Label(
-            settings_frame,
-            text="Min memory (MB):",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 10),
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-
-        min_mem_var = StringVar(value=inst_min_mem)
-        min_mem_entry = Entry(
-            settings_frame,
-            textvariable=min_mem_var,
-            bg="#1f2616",
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-            width=10,
-        )
-        min_mem_entry.grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
-
-        Label(
-            settings_frame,
-            text="Extra JVM args:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 10),
-        ).grid(row=1, column=2, sticky="w", pady=(6, 0))
-
-        extra_jvm_var = StringVar(value=inst_extra_jvm)
-        extra_jvm_entry = Entry(
-            settings_frame,
-            textvariable=extra_jvm_var,
-            bg="#1f2616",
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-            width=45,
-        )
-        extra_jvm_entry.grid(row=1, column=3, columnspan=3, sticky="we", padx=(6, 0), pady=(6, 0))
-
-        def save_instance_settings():
-            inst = load_instance_json(mp_dir) or create_default_instance_json(mp_dir, name)
-            launcher = inst.get("launcher") or {}
-            lv = launcher.get("loaderVersion") or {}
-
-            mc = mc_var.get().strip()
-            loader = normalize_loader_name(loader_var.get())
-            max_mem_raw = mem_var.get().strip()
-            min_mem_raw = min_mem_var.get().strip()
-            extra_jvm_raw = extra_jvm_var.get().strip()
-
-            # loaderVersion.type uses capitalized loader name, rawVersion keeps "<mc>-<loaderver>".
-            if loader == "forge":
-                lv["type"] = "Forge"
-            elif loader == "neoforge":
-                lv["type"] = "NeoForge"
-            elif loader == "fabric":
-                lv["type"] = "Fabric"
-            elif loader == "quilt":
-                lv["type"] = "Quilt"
-            else:
-                lv["type"] = loader
-
-            if mc:
-                raw = lv.get("rawVersion")
-                if isinstance(raw, str) and raw:
-                    # preserve "-<loaderver>" if present
-                    parts = raw.split("-", 1)
-                    if len(parts) == 2:
-                        lv["rawVersion"] = f"{mc}-{parts[1]}"
-                    else:
-                        lv["rawVersion"] = mc
-                else:
-                    lv["rawVersion"] = mc
-
-            launcher["loaderVersion"] = lv
-
-            try:
-                launcher["maximumMemory"] = int(max_mem_raw) if max_mem_raw else launcher.get("maximumMemory", 4096)
-            except ValueError:
-                launcher["maximumMemory"] = launcher.get("maximumMemory", 4096)
-
-            try:
-                launcher["requiredMemory"] = int(min_mem_raw) if min_mem_raw else launcher.get("requiredMemory", 0)
-            except ValueError:
-                launcher["requiredMemory"] = launcher.get("requiredMemory", 0)
-
-            launcher["additionalJvmArgs"] = extra_jvm_raw
-
-            inst["launcher"] = launcher
-            save_instance_json(mp_dir, inst)
-            self._update_detail_panel(self.selected_modpack.get())
-            self.log("Saved instance settings (instance.json).", source="LAUNCHER")
-
-        self._mk_main_button(
-            add_mod_frame,
-            "Save Instance Settings",
-            save_instance_settings,
-        ).pack(side="left", padx=8)
-
-        def on_save():
-            old_name = name
-            new_name = name_var.get().strip()
-            if not new_name:
-                messagebox.showwarning("Invalid name", "Please enter a modpack name.")
-                return
-            safe_name = "".join(c for c in new_name if c not in "\\/:*?\"<>|")
-            if not safe_name:
-                messagebox.showwarning(
-                    "Invalid name",
-                    "Name contains only invalid characters.",
-                )
-                return
-
-            effective_mp_dir = mp_dir
-            if safe_name != old_name:
-                new_dir = Path(MODPACKS_DIR) / safe_name
-                if new_dir.exists():
-                    messagebox.showerror(
-                        "Already exists",
-                        f"A modpack named '{safe_name}' already exists.",
-                    )
-                    return
-                mp_dir.rename(new_dir)
-                effective_mp_dir = new_dir
-                if self.config.get("last_selected_modpack") == old_name:
-                    self.config["last_selected_modpack"] = safe_name
-                self.selected_modpack.set(safe_name)
-
-            # Ensure instance.json exists
-            if load_instance_json(effective_mp_dir) is None:
-                save_instance_json(
-                    effective_mp_dir,
-                    create_default_instance_json(effective_mp_dir, self.selected_modpack.get()),
-                )
-
-            save_config(self.config)
             self._load_modpacks_into_list()
-            for idx in range(self.modpack_listbox.size()):
-                if self.modpack_listbox.get(idx) == self.selected_modpack.get():
-                    self.modpack_listbox.selection_clear(0, END)
-                    self.modpack_listbox.selection_set(idx)
-                    self.modpack_listbox.activate(idx)
-                    self._on_modpack_selected()
-                    break
-            dialog.destroy()
-            self.log(f"Updated modpack '{self.selected_modpack.get()}'.")
 
-        btn_frame = Frame(dialog, bg=self.panel_color)
-        btn_frame.pack(padx=10, pady=10, fill="x")
-
-        self._mk_main_button(btn_frame, "Save", on_save).pack(
-            side="right", padx=5
-        )
-        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(
-            side="right", padx=5
-        )
-
-    def delete_modpack(self):
-        name = self.selected_modpack.get()
-        if not name:
-            messagebox.showinfo("No selection", "Please select a modpack first.")
-            return
-        mp_dir = Path(MODPACKS_DIR) / name
-        if not mp_dir.exists():
-            messagebox.showerror(
-                "Missing folder",
-                f"The folder for '{name}' is missing.\nExpected: {mp_dir}",
-            )
-            return
-        if not messagebox.askyesno(
-            "Delete modpack",
-            f"Are you sure you want to permanently delete '{name}'?",
-        ):
-            return
-        shutil.rmtree(mp_dir)
-
-        self._load_modpacks_into_list()
-        self.selected_modpack.set("")
-        self._update_detail_panel(None)
-        if self.config.get("last_selected_modpack") == name:
-            self.config["last_selected_modpack"] = ""
-            save_config(self.config)
-        self.log(f"Deleted modpack '{name}'.")
-
-    # ----- Import modpack -----
+        row = Frame(dialog, bg=self.panel_color)
+        row.pack(fill="x", padx=10, pady=10)
+        self._mk_main_button(row, "Create", on_create).pack(side="right", padx=5)
+        self._mk_main_button(row, "Cancel", dialog.destroy).pack(side="right", padx=5)
 
     def import_modpack_dialog(self):
-        file_path = filedialog.askopenfilename(
-            title="Import CurseForge/Modrinth Modpack",
+        archive = filedialog.askopenfilename(
+            title="Import modpack",
             filetypes=[
-                ("Modpack files", "*.zip;*.mrpack"),
-                ("ZIP files", "*.zip"),
-                ("Modrinth packs", "*.mrpack"),
+                ("Modrinth modpack", "*.mrpack"),
+                ("CurseForge modpack", "*.zip"),
                 ("All files", "*.*"),
             ],
         )
-        if not file_path:
+        if not archive:
             return
 
-        src = Path(file_path)
+        archive_path = Path(archive)
+        default_name = archive_path.stem
 
         dialog = Toplevel(self.root)
         dialog.title("Import Modpack")
@@ -2039,297 +1194,405 @@ class MinecraftLauncherApp:
         dialog.grab_set()
         dialog.resizable(False, False)
 
-        Label(
-            dialog,
-            text=f"Import from: {src.name}",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 10, "bold"),
-        ).pack(padx=10, pady=(10, 3), anchor="w")
+        Label(dialog, text="Modpack name:", bg=self.panel_color, fg=self.text_color).pack(
+            padx=10, pady=(10, 3), anchor="w"
+        )
 
-        Label(
-            dialog,
-            text="New Modpack Name:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(5, 3), anchor="w")
-
-        name_var = StringVar(value=src.stem)
-        entry = Entry(
+        name_var = StringVar(value=default_name)
+        Entry(
             dialog,
             textvariable=name_var,
             bg="#1f2616",
             fg=self.text_color,
             insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-        )
-        entry.pack(padx=10, pady=3, fill="x")
-        entry.focus_set()
+        ).pack(padx=10, pady=3, fill="x")
 
         def on_import():
             name = name_var.get().strip()
             if not name:
                 messagebox.showwarning("Invalid name", "Please enter a modpack name.")
                 return
-            safe_name = "".join(c for c in name if c not in "\\/:*?\"<>|")
-            if not safe_name:
-                messagebox.showwarning(
-                    "Invalid name",
-                    "Name contains only invalid characters.",
-                )
-                return
+            dialog.destroy()
 
-            dest_dir = Path(MODPACKS_DIR) / safe_name
-            if dest_dir.exists():
-                messagebox.showerror(
-                    "Already exists",
-                    f"A modpack named '{safe_name}' already exists.",
-                )
-                return
+            def worker():
+                try:
+                    self._do_import_modpack(archive_path, name)
+                except Exception as e:
+                    self.log(str(e), source="LAUNCHER")
+                    self.root.after(0, lambda: messagebox.showerror("Import failed", str(e)))
 
-            (dest_dir / "mods").mkdir(parents=True, exist_ok=True)
-            (dest_dir / "config").mkdir(parents=True, exist_ok=True)
-            (dest_dir / "resourcepacks").mkdir(parents=True, exist_ok=True)
+            threading.Thread(target=worker, daemon=True).start()
+
+        row = Frame(dialog, bg=self.panel_color)
+        row.pack(fill="x", padx=10, pady=10)
+        self._mk_main_button(row, "Import", on_import).pack(side="right", padx=5)
+        self._mk_main_button(row, "Cancel", dialog.destroy).pack(side="right", padx=5)
+
+    def _do_import_modpack(self, archive_path: Path, name: str):
+        mp_dir = MODPACKS_DIR / name
+        if mp_dir.exists():
+            raise RuntimeError("A modpack with that name already exists.")
+
+        mp_dir.mkdir(parents=True, exist_ok=True)
+        (mp_dir / "mods").mkdir(parents=True, exist_ok=True)
+        (mp_dir / "config").mkdir(parents=True, exist_ok=True)
+        (mp_dir / "resourcepacks").mkdir(parents=True, exist_ok=True)
+
+        instance = create_default_instance_json(name)
+        launcher = instance.get("launcher") or {}
+        lv = launcher.get("loaderVersion") or {}
+
+        suffix = archive_path.suffix.lower()
+        if suffix == ".mrpack":
+            self.log(f"Importing Modrinth modpack: {archive_path.name}", source="LAUNCHER")
+            index = import_modrinth_modpack(archive_path, mp_dir, self.log)
+
+            deps = (index or {}).get("dependencies") or {}
+            mc = deps.get("minecraft")
+            if isinstance(mc, str) and mc:
+                lv["rawVersion"] = mc
+
+            if "neoforge" in deps:
+                lv["type"] = "neoforge"
+                if mc:
+                    lv["rawVersion"] = f"{mc}-{deps['neoforge']}"
+            elif "forge" in deps:
+                lv["type"] = "forge"
+                if mc:
+                    lv["rawVersion"] = f"{mc}-{deps['forge']}"
+            elif "fabric-loader" in deps:
+                lv["type"] = "fabric"
+                if mc:
+                    lv["rawVersion"] = f"{mc}-{deps['fabric-loader']}"
+            elif "quilt-loader" in deps:
+                lv["type"] = "quilt"
+                if mc:
+                    lv["rawVersion"] = f"{mc}-{deps['quilt-loader']}"
+
+        elif suffix == ".zip":
+            self.log(f"Importing CurseForge modpack: {archive_path.name}", source="LAUNCHER")
+            manifest = import_curseforge_modpack(archive_path, mp_dir)
+
+            mc = ((manifest or {}).get("minecraft") or {}).get("version")
+            if isinstance(mc, str) and mc:
+                lv["rawVersion"] = mc
+
+            modloaders = ((manifest or {}).get("minecraft") or {}).get("modLoaders") or []
+            if modloaders:
+                mid = (modloaders[0] or {}).get("id")
+                if isinstance(mid, str) and "-" in mid:
+                    loader_name, loader_ver = mid.split("-", 1)
+                    lv["type"] = normalize_loader_name(loader_name)
+                    if mc:
+                        lv["rawVersion"] = f"{mc}-{loader_ver}"
+        else:
+            raise RuntimeError("Unsupported modpack format. Use .mrpack or .zip")
+
+        launcher["loaderVersion"] = lv
+        instance["launcher"] = launcher
+        save_instance_json(mp_dir, instance)
+
+        def update_ui():
+            self._load_modpacks_into_list()
+            names = list_modpacks()
+            if name in names:
+                idx = names.index(name)
+                self.modpack_listbox.selection_clear(0, END)
+                self.modpack_listbox.selection_set(idx)
+                self.modpack_listbox.see(idx)
+                self.selected_modpack.set(name)
+                self.config["last_selected_modpack"] = name
+                save_config(self.config)
+                self._update_details()
+
+        self.root.after(0, update_ui)
+
+    def edit_modpack_dialog(self):
+        name = self.selected_modpack.get()
+        if not name:
+            messagebox.showinfo("No modpack", "Select a modpack first.")
+            return
+
+        mp_dir = MODPACKS_DIR / name
+        if not mp_dir.exists():
+            messagebox.showerror("Missing", f"Modpack folder missing: {mp_dir}")
+            return
+
+        inst = load_instance_json(mp_dir)
+        if inst is None:
+            inst = create_default_instance_json(name)
+            save_instance_json(mp_dir, inst)
+
+        launcher = inst.get("launcher") or {}
+        lv = launcher.get("loaderVersion") or {}
+
+        dialog = Toplevel(self.root)
+        dialog.title(f"Edit Modpack: {name}")
+        dialog.configure(bg=self.panel_color)
+        dialog.grab_set()
+        dialog.geometry("720x460")
+
+        top = Frame(dialog, bg=self.panel_color)
+        top.pack(fill="x", padx=10, pady=10)
+
+        Label(top, text="Minecraft version:", bg=self.panel_color, fg=self.text_color).grid(row=0, column=0, sticky="w")
+        mc_var = StringVar(value=get_instance_minecraft_version(inst) or "")
+        Entry(top, textvariable=mc_var, bg="#1f2616", fg=self.text_color, insertbackground=self.text_color).grid(
+            row=0, column=1, sticky="we", padx=(8, 0)
+        )
+
+        Label(top, text="Loader:", bg=self.panel_color, fg=self.text_color).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        loader_choices = ["", "forge", "fabric", "quilt", "neoforge"]
+        loader_var = StringVar(value=normalize_loader_name(lv.get("type") or ""))
+        OptionMenu(top, loader_var, *loader_choices).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        Label(top, text="Max memory (MB):", bg=self.panel_color, fg=self.text_color).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        max_mem_var = StringVar(value=str((launcher.get("maximumMemory") or 4096)))
+        Entry(top, textvariable=max_mem_var, bg="#1f2616", fg=self.text_color, insertbackground=self.text_color).grid(
+            row=2, column=1, sticky="we", padx=(8, 0), pady=(6, 0)
+        )
+
+        Label(top, text="Min memory (MB):", bg=self.panel_color, fg=self.text_color).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        min_mem_var = StringVar(value=str((launcher.get("requiredMemory") or 0)))
+        Entry(top, textvariable=min_mem_var, bg="#1f2616", fg=self.text_color, insertbackground=self.text_color).grid(
+            row=3, column=1, sticky="we", padx=(8, 0), pady=(6, 0)
+        )
+
+        Label(top, text="Extra JVM args:", bg=self.panel_color, fg=self.text_color).grid(row=4, column=0, sticky="w", pady=(6, 0))
+        extra_var = StringVar(value=str(launcher.get("additionalJvmArgs") or ""))
+        Entry(top, textvariable=extra_var, bg="#1f2616", fg=self.text_color, insertbackground=self.text_color).grid(
+            row=4, column=1, sticky="we", padx=(8, 0), pady=(6, 0)
+        )
+
+        top.columnconfigure(1, weight=1)
+
+        mid = Frame(dialog, bg=self.panel_color)
+        mid.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        Label(mid, text="Mods:", bg=self.panel_color, fg=self.text_color, font=("Helvetica", 11, "bold")).pack(anchor="w")
+
+        mods_list = Listbox(
+            mid,
+            bg="#1f2616",
+            fg=self.text_color,
+            selectbackground=self.button_color,
+            selectforeground=self.text_color,
+            highlightthickness=0,
+            borderwidth=0,
+            activestyle="none",
+            font=("Helvetica", 10),
+        )
+        mods_list.pack(fill="both", expand=True, pady=5)
+
+        mods_dir = mp_dir / "mods"
+        mods_dir.mkdir(parents=True, exist_ok=True)
+        for p in sorted(mods_dir.glob("*.jar")):
+            mods_list.insert(END, p.name)
+
+        btn_row = Frame(mid, bg=self.panel_color)
+        btn_row.pack(fill="x")
+
+        def on_remove_selected():
+            sel = mods_list.curselection()
+            if not sel:
+                return
+            fname = mods_list.get(sel[0])
+            try:
+                (mods_dir / fname).unlink()
+            except OSError:
+                pass
+            mods_list.delete(sel[0])
+
+        self._mk_main_button(btn_row, "Add Mod", lambda: self.add_mod_dialog(mp_dir, mods_list)).pack(side="left", padx=3)
+        self._mk_main_button(btn_row, "Remove", on_remove_selected).pack(side="left", padx=3)
+
+        bottom = Frame(dialog, bg=self.panel_color)
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+
+        def on_save():
+            launcher = inst.get("launcher") or {}
+            lv = launcher.get("loaderVersion") or {}
+
+            mc = mc_var.get().strip()
+            loader = loader_var.get().strip()
+
+            try:
+                max_mem = int(max_mem_var.get().strip())
+            except ValueError:
+                max_mem = 4096
+
+            try:
+                min_mem = int(min_mem_var.get().strip())
+            except ValueError:
+                min_mem = 0
+
+            lv["type"] = loader
+            launcher["loaderVersion"] = lv
+            launcher["maximumMemory"] = max_mem
+            launcher["requiredMemory"] = min_mem
+            launcher["additionalJvmArgs"] = extra_var.get()
+
+            # store mc version on rawVersion for now
+            if mc:
+                lv["rawVersion"] = mc
+
+            inst["launcher"] = launcher
+            save_instance_json(mp_dir, inst)
 
             dialog.destroy()
-            threading.Thread(
-                target=self._do_import_modpack,
-                args=(src, safe_name, dest_dir),
-                daemon=True,
-            ).start()
+            self._update_details()
 
-        btn_frame = Frame(dialog, bg=self.panel_color)
-        btn_frame.pack(padx=10, pady=10, fill="x")
+        self._mk_main_button(bottom, "Save", on_save).pack(side="right", padx=5)
+        self._mk_main_button(bottom, "Close", dialog.destroy).pack(side="right", padx=5)
 
-        self._mk_main_button(btn_frame, "Import", on_import).pack(
-            side="right", padx=5
-        )
-        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(
-            side="right", padx=5
-        )
+    def delete_modpack(self):
+        name = self.selected_modpack.get()
+        if not name:
+            messagebox.showinfo("No modpack", "Select a modpack first.")
+            return
+        mp_dir = MODPACKS_DIR / name
+        if not mp_dir.exists():
+            return
+        if not messagebox.askyesno("Delete", f"Delete modpack '{name}'? This removes {mp_dir}."):
+            return
+        shutil.rmtree(mp_dir)
+        self.selected_modpack.set("")
+        self._load_modpacks_into_list()
+        self._update_details()
 
-    def _do_import_modpack(self, src: Path, name: str, dest_dir: Path):
-        try:
-            ext = src.suffix.lower()
-            self.log(f"Importing modpack '{name}' from {src.name}...", source="LAUNCHER")
-
-            if ext == ".mrpack":
-                import_modrinth_modpack(src, dest_dir, self.log)
-                # No standardized instance metadata in .mrpack we rely on here
-                if load_instance_json(dest_dir) is None:
-                    save_instance_json(dest_dir, create_default_instance_json(dest_dir, name))
-            else:
-                manifest = import_curseforge_modpack(src, dest_dir)
-                if manifest is not None:
-                    inst = create_default_instance_json(dest_dir, name)
-                    launcher = inst.get("launcher") or {}
-                    launcher["enableCurseForgeIntegration"] = True
-
-                    # CurseForge manifest: minecraft.modLoaders[0].id like "forge-47.3.11"
-                    mc = manifest.get("minecraft") or {}
-                    mod_loaders = mc.get("modLoaders") or []
-                    if mod_loaders:
-                        ml = mod_loaders[0] or {}
-                        ml_id = ml.get("id")
-                        if isinstance(ml_id, str) and ml_id:
-                            if ml_id.startswith("forge-"):
-                                launcher.setdefault("loaderVersion", {})
-                                launcher["loaderVersion"]["type"] = "Forge"
-                                launcher["loaderVersion"]["version"] = ml_id.split("-", 1)[1]
-                                gv = mc.get("version")
-                                if isinstance(gv, str) and gv:
-                                    launcher["loaderVersion"]["rawVersion"] = f"{gv}-{launcher['loaderVersion']['version']}"
-                            elif ml_id.startswith("fabric-"):
-                                launcher.setdefault("loaderVersion", {})
-                                launcher["loaderVersion"]["type"] = "Fabric"
-                                launcher["loaderVersion"]["version"] = ml_id.split("-", 1)[1]
-                                gv = mc.get("version")
-                                if isinstance(gv, str) and gv:
-                                    launcher["loaderVersion"]["rawVersion"] = gv
-
-                    cf_project = manifest.get("manifest") or {}
-                    if cf_project:
-                        launcher["externalPackId"] = cf_project.get("projectID", 0) or 0
-                        launcher["version"] = cf_project.get("version", launcher.get("version", "1.0.0"))
-
-                    inst["launcher"] = launcher
-                    save_instance_json(dest_dir, inst)
-                else:
-                    if load_instance_json(dest_dir) is None:
-                        save_instance_json(dest_dir, create_default_instance_json(dest_dir, name))
-
-            self.log(f"Imported modpack '{name}'.", source="LAUNCHER")
-            self._load_modpacks_into_list()
-
-            for idx in range(self.modpack_listbox.size()):
-                if self.modpack_listbox.get(idx) == name:
-                    self.modpack_listbox.selection_clear(0, END)
-                    self.modpack_listbox.selection_set(idx)
-                    self.modpack_listbox.activate(idx)
-                    self._on_modpack_selected()
-                    break
-
-        except Exception as e:
-            messagebox.showerror(
-                "Import error",
-                f"Failed to import modpack:\n{e}",
-            )
-            self.log("Failed to import modpack.", source="LAUNCHER")
-
-    # ----- Add single mod (CF / Modrinth) -----
-
-    def add_mod_to_modpack_dialog(self, mp_dir: Path):
+    def install_vanilla_version_dialog(self):
         dialog = Toplevel(self.root)
-        dialog.title("Add Mod to Modpack")
+        dialog.title("Install Vanilla Version")
         dialog.configure(bg=self.panel_color)
         dialog.grab_set()
         dialog.resizable(False, False)
 
         Label(
             dialog,
-            text="Source:",
+            text="Minecraft Version ID (e.g. 1.21.1):",
             bg=self.panel_color,
             fg=self.text_color,
             font=("Helvetica", 11),
         ).pack(padx=10, pady=(10, 3), anchor="w")
 
-        source_var = StringVar(value="modrinth")
-        source_frame = Frame(dialog, bg=self.panel_color)
-        source_frame.pack(padx=10, pady=(0, 5), fill="x")
-
-        def set_source_modrinth():
-            source_var.set("modrinth")
-
-        def set_source_curseforge():
-            source_var.set("curseforge")
-
-        self._mk_main_button(
-            source_frame, "Modrinth", set_source_modrinth
-        ).pack(side="left", padx=3)
-        self._mk_main_button(
-            source_frame, "CurseForge", set_source_curseforge
-        ).pack(side="left", padx=3)
-
-        Label(
+        version_var = StringVar(value="1.21.1")
+        entry = Entry(
             dialog,
-            text="Mod URL or ID:",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(5, 3), anchor="w")
-
-        url_var = StringVar()
-        url_entry = Entry(
-            dialog,
-            textvariable=url_var,
+            textvariable=version_var,
             bg="#1f2616",
             fg=self.text_color,
             insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-            width=60,
         )
-        url_entry.pack(padx=10, pady=3, fill="x")
-        url_entry.focus_set()
+        entry.pack(padx=10, pady=3, fill="x")
+        entry.focus_set()
 
-        hint = (
-            "Modrinth: paste a project URL (e.g. https://modrinth.com/mod/sodium)\n"
-            "          or slug (e.g. 'sodium'). Latest version will be used.\n"
-            "CurseForge: paste a direct .jar file URL OR project slug/URL/ID.\n"
-            "Mods will be downloaded into this modpack's 'mods' folder."
-        )
-        Label(
-            dialog,
-            text=hint,
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 9),
-            justify="left",
-        ).pack(padx=10, pady=(0, 8), anchor="w")
-
-        def on_add():
-            source = source_var.get()
-            text = url_var.get().strip()
-            if not text:
-                messagebox.showwarning("Missing URL/ID", "Please enter a URL or ID.")
+        def on_install():
+            version_id = version_var.get().strip()
+            if not version_id:
+                messagebox.showwarning("Invalid version", "Please enter a version ID.")
                 return
             dialog.destroy()
-            threading.Thread(
-                target=self._do_add_mod_to_modpack,
-                args=(source, text, mp_dir),
-                daemon=True,
-            ).start()
+            threading.Thread(target=self._do_install_vanilla_version, args=(version_id,), daemon=True).start()
 
         btn_frame = Frame(dialog, bg=self.panel_color)
         btn_frame.pack(padx=10, pady=10, fill="x")
 
-        self._mk_main_button(btn_frame, "Add", on_add).pack(
-            side="right", padx=5
-        )
-        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(
-            side="right", padx=5
-        )
+        self._mk_main_button(btn_frame, "Install", on_install).pack(side="right", padx=5)
+        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(side="right", padx=5)
 
-    def _do_add_mod_to_modpack(self, source: str, text: str, mp_dir: Path):
+    def _do_install_vanilla_version(self, version_id: str):
         try:
-            mods_dir = mp_dir / "mods"
-            mods_dir.mkdir(parents=True, exist_ok=True)
-
-            instance = load_instance_json(mp_dir)
-            if instance is None:
-                instance = create_default_instance_json(mp_dir, mp_dir.name)
-                save_instance_json(mp_dir, instance)
-
-            target_mc_version = get_instance_minecraft_version(instance)
-            if not target_mc_version:
-                target_mc_version = infer_minecraft_version_from_args_filename(self.args_file_var.get())
-
-            target_loader = get_instance_loader(instance)
-
-            if source == "modrinth":
-                self._add_mod_from_modrinth(text, mods_dir, target_mc_version, target_loader)
-            else:
-                self._add_mod_from_curseforge(text, mods_dir, target_mc_version, target_loader)
-
+            args_file = download_vanilla_version(version_id, self.config, self.log)
+            self._refresh_args_file_options()
+            self._on_select_args_file(args_file.name)
         except Exception as e:
-            messagebox.showerror(
-                "Add mod error",
-                f"Failed to add mod:\n{e}",
-            )
-            self.log("Failed to add mod.", source="LAUNCHER")
+            messagebox.showerror("Install error", f"Failed to install vanilla {version_id}:\n{e}")
+            self.log("Failed to install vanilla version.", source="LAUNCHER")
 
-    def _add_mod_from_modrinth(
-        self,
-        text: str,
-        mods_dir: Path,
-        target_mc_version: Optional[str],
-        target_loader: Optional[str],
-    ):
-        import re
+    def add_mod_dialog(self, mp_dir: Path, mods_list: Listbox):
+        inst = load_instance_json(mp_dir)
+        target_mc_version = get_instance_minecraft_version(inst) or infer_minecraft_version_from_args_filename(self.args_file_var.get())
+        target_loader = get_instance_loader(inst)
 
-        self.log(f"Resolving Modrinth project from '{text}'...", source="LAUNCHER")
+        dialog = Toplevel(self.root)
+        dialog.title("Add Mod")
+        dialog.configure(bg=self.panel_color)
+        dialog.grab_set()
+        dialog.resizable(False, False)
 
-        m = re.search(r"modrinth\.com/mod/([^/]+)", text)
-        if not m:
-            m = re.search(r"modrinth\.com/project/([^/]+)", text)
-        if m:
-            project_id = m.group(1)
-        else:
-            project_id = text
+        Label(dialog, text="Source:", bg=self.panel_color, fg=self.text_color).pack(padx=10, pady=(10, 3), anchor="w")
+        source_var = StringVar(value="Modrinth")
+        OptionMenu(dialog, source_var, "Modrinth", "CurseForge").pack(padx=10, pady=3, anchor="w")
 
-        url_project = f"{MODRINTH_API_URL}/project/{project_id}"
-        with urllib.request.urlopen(url_project) as resp:
-            project = json.loads(resp.read().decode("utf-8"))
+        Label(dialog, text="Project URL / slug / id:", bg=self.panel_color, fg=self.text_color).pack(
+            padx=10, pady=(8, 3), anchor="w"
+        )
+        text_var = StringVar(value="")
+        Entry(dialog, textvariable=text_var, bg="#1f2616", fg=self.text_color, insertbackground=self.text_color).pack(
+            padx=10, pady=3, fill="x"
+        )
 
-        project_id = project["id"]
-        slug = project.get("slug", project_id)
-        self.log(f"Modrinth project resolved: {slug} ({project_id})", source="LAUNCHER")
+        hint = f"Target MC: {target_mc_version or 'unknown'} | Loader: {target_loader or 'any'}"
+        Label(dialog, text=hint, bg=self.panel_color, fg=self.text_color, font=("Helvetica", 9)).pack(
+            padx=10, pady=(0, 8), anchor="w"
+        )
 
-        versions_url = f"{MODRINTH_API_URL}/project/{project_id}/version"
+        def on_add():
+            txt = text_var.get().strip()
+            if not txt:
+                messagebox.showwarning("Missing", "Enter a URL/slug/id.")
+                return
+            dialog.destroy()
+
+            def worker():
+                try:
+                    mods_dir = mp_dir / "mods"
+                    mods_dir.mkdir(parents=True, exist_ok=True)
+
+                    if source_var.get() == "Modrinth":
+                        self._add_mod_from_modrinth(txt, mods_dir, target_mc_version, target_loader)
+                    else:
+                        self._add_mod_from_curseforge(txt, mods_dir, target_mc_version, target_loader)
+
+                    self.root.after(0, lambda: self._reload_mods_list(mods_list, mods_dir))
+                except Exception as e:
+                    self.log(str(e), source="LAUNCHER")
+                    self.root.after(0, lambda: messagebox.showerror("Add mod failed", str(e)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn = Frame(dialog, bg=self.panel_color)
+        btn.pack(fill="x", padx=10, pady=10)
+        self._mk_main_button(btn, "Add", on_add).pack(side="right", padx=5)
+        self._mk_main_button(btn, "Cancel", dialog.destroy).pack(side="right", padx=5)
+
+    def _reload_mods_list(self, mods_list: Listbox, mods_dir: Path):
+        mods_list.delete(0, END)
+        for p in sorted(mods_dir.glob("*.jar")):
+            mods_list.insert(END, p.name)
+
+    def _mr_resolve_project_id(self, text: str) -> str:
+        parsed = urllib.parse.urlparse(text.strip())
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            parts = [p for p in parsed.path.split("/") if p]
+            if "mod" in parts:
+                i = parts.index("mod")
+                if i + 1 < len(parts):
+                    return parts[i + 1]
+            if len(parts) >= 2 and parts[0] == "mod":
+                return parts[1]
+            if parts:
+                return parts[-1]
+        return text.strip()
+
+    def _add_mod_from_modrinth(self, text: str, mods_dir: Path, target_mc_version: Optional[str], target_loader: Optional[str]):
+        project_id = self._mr_resolve_project_id(text)
+
+        # project slug/id resolves here
+        with urllib.request.urlopen(f"{MODRINTH_API_URL}/project/{project_id}") as resp:
+            proj = json.loads(resp.read().decode("utf-8"))
+        real_id = proj.get("id") or project_id
+        title = proj.get("title") or project_id
 
         params = {}
         if target_mc_version:
@@ -2337,53 +1600,46 @@ class MinecraftLauncherApp:
         if target_loader:
             params["loaders"] = json.dumps([normalize_loader_name(target_loader)])
 
+        url = f"{MODRINTH_API_URL}/project/{real_id}/version"
         if params:
-            versions_url = versions_url + "?" + urllib.parse.urlencode(params)
-            self.log(
-                f"Filtering Modrinth versions: mc={target_mc_version or '*'} loader={target_loader or '*'}",
-                source="LAUNCHER",
-            )
+            url = url + "?" + urllib.parse.urlencode(params)
 
-        with urllib.request.urlopen(versions_url) as resp:
-            versions = json.loads(resp.read().decode("utf-8"))
-
-        if not versions:
-            # If filters were too strict, retry without filters
-            if params:
-                self.log("No matching Modrinth versions found; retrying without filters...", source="LAUNCHER")
-                with urllib.request.urlopen(f"{MODRINTH_API_URL}/project/{project_id}/version") as resp:
-                    versions = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(url) as resp:
+                versions = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError:
+            with urllib.request.urlopen(f"{MODRINTH_API_URL}/project/{real_id}/version") as resp:
+                versions = json.loads(resp.read().decode("utf-8"))
 
         if not versions:
-            raise RuntimeError("No versions found on Modrinth project.")
+            raise RuntimeError(f"No versions found for Modrinth project {title}.")
 
-        version = versions[0]
-        files = version.get("files", [])
+        chosen = versions[0]
+        files = chosen.get("files") or []
         if not files:
-            raise RuntimeError("No files in selected Modrinth version.")
+            raise RuntimeError("Modrinth version has no files.")
 
-        file_info = None
+        main_file = None
         for f in files:
             if f.get("primary"):
-                file_info = f
+                main_file = f
                 break
-        if file_info is None:
-            file_info = files[0]
+        if main_file is None:
+            main_file = files[0]
 
-        file_url = file_info["url"]
-        filename = file_info["filename"]
+        file_url = main_file.get("url")
+        filename = main_file.get("filename")
+        if not file_url or not filename:
+            raise RuntimeError("Modrinth file info missing.")
 
         target = mods_dir / filename
-        self.log(f"Downloading Modrinth mod '{slug}' -> {target}", source="LAUNCHER")
+        self.log(f"Downloading Modrinth mod '{title}' -> {filename}", source="LAUNCHER")
         download_to_file(file_url, target)
-        self.log(f"Added Modrinth mod '{slug}' as {filename}", source="LAUNCHER")
-
-    # ----- CurseForge API helpers -----
 
     def _cf_api_request(self, path: str) -> dict:
         api_key = CURSEFORGE_API_KEY.strip()
         if not api_key:
-            raise RuntimeError("CURSEFORGE_API_KEY is empty. Set it at the top of the script.")
+            raise RuntimeError("CURSEFORGE_API_KEY is empty.")
 
         url = "https://api.curseforge.com" + path
         req = urllib.request.Request(url)
@@ -2395,37 +1651,31 @@ class MinecraftLauncherApp:
         return json.loads(data)
 
     def _cf_resolve_project(self, text: str) -> int:
-        import re
+        parsed = urllib.parse.urlparse(text)
+        slug = text.strip()
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            parts = [p for p in parsed.path.split("/") if p]
+            # /minecraft/mc-mods/<slug>
+            if "mc-mods" in parts:
+                i = parts.index("mc-mods")
+                if i + 1 < len(parts):
+                    slug = parts[i + 1]
 
-        text = text.strip()
-
-        if text.isdigit():
-            return int(text)
-
-        m = re.search(r"curseforge\.com/minecraft/mc-mods/([^/]+)", text)
-        if m:
-            slug = m.group(1)
-        else:
-            slug = text
-
-        params = f"?gameId={CURSEFORGE_GAME_ID_MINECRAFT}&searchFilter={urllib.parse.quote(slug)}"
-        data = self._cf_api_request("/v1/mods/search" + params)
-        mods = data.get("data", [])
+        q = urllib.parse.urlencode(
+            {
+                "gameId": CURSEFORGE_GAME_ID_MINECRAFT,
+                "classId": 6,
+                "searchFilter": slug,
+                "pageSize": 1,
+            }
+        )
+        data = self._cf_api_request(f"/v1/mods/search?{q}")
+        mods = data.get("data") or []
         if not mods:
-            raise RuntimeError(f"No CurseForge mods found for slug '{slug}'.")
+            raise RuntimeError(f"CurseForge project not found for '{text}'.")
+        return int(mods[0]["id"])
 
-        mod = mods[0]
-        mod_id = mod["id"]
-        name = mod.get("name", "")
-        self.log(f"CurseForge project resolved: {name} (id={mod_id})", source="LAUNCHER")
-        return mod_id
-
-    def _cf_pick_file_for_mod(
-        self,
-        mod_id: int,
-        target_mc_version: Optional[str],
-        target_loader: Optional[str],
-    ) -> dict:
+    def _cf_pick_file_for_mod(self, mod_id: int, target_mc_version: Optional[str], target_loader: Optional[str]) -> dict:
         query = {}
         if target_mc_version:
             query["gameVersion"] = target_mc_version
@@ -2438,9 +1688,7 @@ class MinecraftLauncherApp:
 
         if query:
             try:
-                data = self._cf_api_request(
-                    f"/v1/mods/{mod_id}/files?{urllib.parse.urlencode(query)}"
-                )
+                data = self._cf_api_request(f"/v1/mods/{mod_id}/files?{urllib.parse.urlencode(query)}")
                 files = data.get("data", [])
                 if files:
                     return files[0]
@@ -2452,52 +1700,9 @@ class MinecraftLauncherApp:
         if not files:
             raise RuntimeError(f"No files found for CurseForge mod id={mod_id}.")
 
-        if not target_mc_version and not target_loader:
-            return files[0]
-
-        loader_token = None
-        if target_loader:
-            norm = normalize_loader_name(target_loader)
-            if norm == "forge":
-                loader_token = "Forge"
-            elif norm == "neoforge":
-                loader_token = "NeoForge"
-            elif norm == "fabric":
-                loader_token = "Fabric"
-            elif norm == "quilt":
-                loader_token = "Quilt"
-
-        matching = []
-        for f in files:
-            gv = f.get("gameVersions") or []
-            if target_mc_version and target_mc_version not in gv:
-                continue
-            if loader_token and loader_token not in gv:
-                continue
-            matching.append(f)
-
-        if matching:
-            return matching[0]
-
-        if target_mc_version:
-            for f in files:
-                gv = f.get("gameVersions") or []
-                if target_mc_version in gv:
-                    return f
-
         return files[0]
 
-    def _add_mod_from_curseforge(
-        self,
-        text: str,
-        mods_dir: Path,
-        target_mc_version: Optional[str],
-        target_loader: Optional[str],
-    ):
-        import os
-        import urllib.parse
-        import re
-
+    def _add_mod_from_curseforge(self, text: str, mods_dir: Path, target_mc_version: Optional[str], target_loader: Optional[str]):
         text = text.strip()
         parsed = urllib.parse.urlparse(text)
         path = parsed.path or ""
@@ -2506,32 +1711,16 @@ class MinecraftLauncherApp:
         if is_http_url and path.lower().endswith(".jar"):
             self.log(f"Downloading CurseForge mod from direct URL '{text}'...", source="LAUNCHER")
             name = os.path.basename(path) or "curseforge_mod.jar"
-            target = mods_dir / name
-            download_to_file(text, target)
-            self.log(f"Added CurseForge mod as {name}", source="LAUNCHER")
+            download_to_file(text, mods_dir / name)
             return
 
         if not CURSEFORGE_API_KEY.strip():
-            raise RuntimeError(
-                "CURSEFORGE_API_KEY is empty. Set it at the top of the script or use a direct .jar URL."
-            )
+            raise RuntimeError("CURSEFORGE_API_KEY is empty. Set it or use a direct .jar URL.")
 
         if not is_http_url and text.isdigit():
             mod_id = int(text)
         else:
-            self.log(f"Resolving CurseForge mod via API from '{text}'...", source="LAUNCHER")
             mod_id = self._cf_resolve_project(text)
-
-        if target_mc_version:
-            self.log(
-                f"Target MC version from instance/args: {target_mc_version}",
-                source="LAUNCHER",
-            )
-        if target_loader:
-            self.log(
-                f"Target loader from instance: {normalize_loader_name(target_loader)}",
-                source="LAUNCHER",
-            )
 
         file_info = self._cf_pick_file_for_mod(mod_id, target_mc_version, target_loader)
         file_name = file_info.get("fileName") or "curseforge_mod.jar"
@@ -2540,106 +1729,8 @@ class MinecraftLauncherApp:
             raise RuntimeError("CurseForge file has no downloadUrl.")
 
         target = mods_dir / file_name
-        self.log(f"Downloading CurseForge file id={file_info.get('id')} -> {target}", source="LAUNCHER")
+        self.log(f"Downloading CurseForge mod id={mod_id} -> {file_name}", source="LAUNCHER")
         download_to_file(download_url, target)
-        self.log(f"Added CurseForge mod as {file_name}", source="LAUNCHER")
-
-    # ----- Install vanilla version -----
-
-    def install_vanilla_version_dialog(self):
-        dialog = Toplevel(self.root)
-        dialog.title("Install Vanilla Version")
-        dialog.configure(bg=self.panel_color)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        Label(
-            dialog,
-            text="Minecraft Version ID (e.g. 1.21.11):",
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 11),
-        ).pack(padx=10, pady=(10, 3), anchor="w")
-
-        version_var = StringVar(value="1.21.11")
-        entry = Entry(
-            dialog,
-            textvariable=version_var,
-            bg="#1f2616",
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            highlightthickness=1,
-            highlightbackground="#101509",
-            highlightcolor=self.accent_color,
-        )
-        entry.pack(padx=10, pady=3, fill="x")
-        entry.focus_set()
-
-        hint = (
-            "This will download the official client, libraries and assets\n"
-            "for the specified version directly from Mojang,\n"
-            "and generate USERDIR/vanilla/java_args_<version>.txt."
-        )
-        Label(
-            dialog,
-            text=hint,
-            bg=self.panel_color,
-            fg=self.text_color,
-            font=("Helvetica", 9),
-            justify="left",
-        ).pack(padx=10, pady=(0, 8), anchor="w")
-
-        def on_install():
-            version_id = version_var.get().strip()
-            if not version_id:
-                messagebox.showwarning("Invalid version", "Please enter a version ID.")
-                return
-            dialog.destroy()
-            threading.Thread(
-                target=self._do_install_vanilla_version,
-                args=(version_id,),
-                daemon=True,
-            ).start()
-
-        btn_frame = Frame(dialog, bg=self.panel_color)
-        btn_frame.pack(padx=10, pady=10, fill="x")
-
-        self._mk_main_button(btn_frame, "Install", on_install).pack(
-            side="right", padx=5
-        )
-        self._mk_main_button(btn_frame, "Cancel", dialog.destroy).pack(
-            side="right", padx=5
-        )
-
-    def _do_install_vanilla_version(self, version_id: str):
-        try:
-            args_file = download_vanilla_version(version_id, self.config, self.log)
-            self.log(
-                f"Installed vanilla {version_id}. Args: USERDIR/vanilla/{args_file.name}",
-                source="LAUNCHER",
-            )
-            self._refresh_args_file_options()
-            self._on_select_args_file(args_file.name)
-        except Exception as e:
-            messagebox.showerror(
-                "Install error",
-                f"Failed to install vanilla {version_id}:\n{e}",
-            )
-            self.log("Failed to install vanilla version.", source="LAUNCHER")
-
-    # ----- Settings -----
-
-    def choose_minecraft_dir(self):
-        directory = filedialog.askdirectory(
-            title="Select your .minecraft folder or instance folder",
-        )
-        if not directory:
-            return
-        self.config["minecraft_dir"] = directory
-        save_config(self.config)
-        self.log(f"Minecraft directory set to: {directory}", source="LAUNCHER")
-
-    # ----- Play logic -----
 
     def play(self):
         name = self.selected_modpack.get()
@@ -2649,26 +1740,20 @@ class MinecraftLauncherApp:
 
         mc_dir = self.config.get("minecraft_dir") or ""
         if not mc_dir or not os.path.isdir(mc_dir):
-            messagebox.showerror(
-                "Minecraft folder not set",
-                "Please set your .minecraft/instance folder in the header first.",
-            )
+            messagebox.showerror("Minecraft folder not set", "Please set your .minecraft folder first.")
             return
 
-        mp_dir = Path(MODPACKS_DIR) / name
+        mp_dir = MODPACKS_DIR / name
         if not mp_dir.exists():
-            messagebox.showerror(
-                "Missing modpack",
-                f"The folder for '{name}' is missing.\nExpected: {mp_dir}",
-            )
+            messagebox.showerror("Missing modpack", f"Modpack folder missing: {mp_dir}")
             return
 
-        instance = load_instance_json(mp_dir)
-        if instance is None:
-            instance = create_default_instance_json(mp_dir, name)
-            save_instance_json(mp_dir, instance)
+        inst = load_instance_json(mp_dir)
+        if inst is None:
+            inst = create_default_instance_json(name)
+            save_instance_json(mp_dir, inst)
 
-        launcher_cfg = instance.get("launcher") or {}
+        launcher_cfg = inst.get("launcher") or {}
         max_mem = launcher_cfg.get("maximumMemory")
         min_mem = launcher_cfg.get("requiredMemory")
         extra_jvm = launcher_cfg.get("additionalJvmArgs")
@@ -2688,81 +1773,42 @@ class MinecraftLauncherApp:
             extra_jvm = ""
 
         java_exe = get_java_executable()
-        if not java_exe.exists():
-            messagebox.showerror(
-                "Java not found",
-                f"Java runtime not found at:\n{java_exe}\n\n"
-                "Ensure the bundled Java was downloaded correctly.",
-            )
+        if sys.platform.startswith("win") and not java_exe.exists():
+            messagebox.showerror("Java not found", f"Bundled Java not found at:\n{java_exe}")
             return
 
         args_name = self.args_file_var.get()
         if args_name.startswith("<no args"):
-            messagebox.showerror(
-                "No args files",
-                "No args files found in USERDIR/vanilla.\n"
-                "Install a vanilla version first or add a java_args_*.txt there.",
-            )
-            self.log("No args files found in USERDIR/vanilla.", source="LAUNCHER")
+            messagebox.showerror("No args", "No vanilla args files found. Install vanilla first.")
             return
 
         args_file = VANILLA_DIR / args_name
         if not args_file.exists():
-            messagebox.showerror(
-                "Args file not found",
-                f"Java arguments file not found:\n{args_file}\n\n"
-                "Select or generate a valid args file.",
-            )
-            self.log(f"Args file not found: {args_file}", source="LAUNCHER")
+            messagebox.showerror("Args missing", f"Args file not found:\n{args_file}")
             return
 
-        try:
-            self.open_console_window()
+        self.open_console_window()
+        self.log(f"Applying modpack '{name}'...", source="LAUNCHER")
 
-            self.log(f"Applying modpack '{name}'...", source="LAUNCHER")
-            self.root.update_idletasks()
+        mods_src = mp_dir / "mods"
+        mods_dst = Path(mc_dir) / "mods"
+        mods_dst.mkdir(parents=True, exist_ok=True)
+        clean_dir(str(mods_dst))
+        copy_tree(str(mods_src), str(mods_dst))
 
-            mods_src = mp_dir / "mods"
-            mods_dst = Path(mc_dir) / "mods"
-            os.makedirs(mods_dst, exist_ok=True)
-            clean_dir(str(mods_dst))
-            copy_tree(str(mods_src), str(mods_dst))
+        config_src = mp_dir / "config"
+        config_dst = Path(mc_dir) / "config"
+        config_dst.mkdir(parents=True, exist_ok=True)
+        copy_tree(str(config_src), str(config_dst))
 
-            config_src = mp_dir / "config"
-            config_dst = Path(mc_dir) / "config"
-            os.makedirs(config_dst, exist_ok=True)
-            copy_tree(str(config_src), str(config_dst))
+        res_src = mp_dir / "resourcepacks"
+        res_dst = Path(mc_dir) / "resourcepacks"
+        res_dst.mkdir(parents=True, exist_ok=True)
+        copy_tree(str(res_src), str(res_dst))
 
-            res_src = mp_dir / "resourcepacks"
-            res_dst = Path(mc_dir) / "resourcepacks"
-            os.makedirs(res_dst, exist_ok=True)
-            copy_tree(str(res_src), str(res_dst))
+        self._launch_with_argfile(java_exe, args_file, max_mem=max_mem, min_mem=min_mem, extra_jvm=extra_jvm)
 
-            mem_note = []
-            if max_mem:
-                mem_note.append(f"-Xmx{max_mem}M")
-            if min_mem:
-                mem_note.append(f"-Xms{min_mem}M")
-
-            extra = (" " + " ".join(mem_note)) if mem_note else ""
-            self.log(
-                f"Modpack '{name}' applied. Launching Minecraft with USERDIR/vanilla/{args_name}{extra}...",
-                source="LAUNCHER",
-            )
-            self._launch_with_argfile(java_exe, args_file, max_mem=max_mem, min_mem=min_mem, extra_jvm=extra_jvm)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to apply modpack or launch: {e}")
-            self.log("Error while applying modpack / launching.", source="LAUNCHER")
-
-    def _launch_with_argfile(
-        self,
-        java_exe: Path,
-        args_file: Path,
-        max_mem: Optional[int] = None,
-        min_mem: Optional[int] = None,
-        extra_jvm: str = "",
-    ):
-        """Launch Java with @<args_file> from USERDIR and stream logs to console."""
+    def _launch_with_argfile(self, java_exe: Path, args_file: Path, max_mem: Optional[int] = None, min_mem: Optional[int] = None, extra_jvm: str = ""):
         try:
             rel_args_path = args_file.relative_to(INSTALL_DIR)
         except ValueError:
@@ -2792,39 +1838,24 @@ class MinecraftLauncherApp:
         except Exception:
             self.log(f"Launch command: {cmd}", source="LAUNCHER")
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(INSTALL_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except Exception as e:
-            messagebox.showerror("Launch error", f"Could not launch Minecraft: {e}")
-            self.log("Failed to launch Minecraft.", source="LAUNCHER")
-            return
-
-        self.log(f"Minecraft launch started ({rel_args_path}).", source="LAUNCHER")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(INSTALL_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
         def reader_thread():
-            try:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    line = line.rstrip("\n\r")
-                    if line:
-                        self.log(line, source="GAME")
-            except Exception as e:
-                self.log(f"Error reading game output: {e}", source="LAUNCHER")
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip("\n\r")
+                if line:
+                    self.log(line, source="GAME")
 
         threading.Thread(target=reader_thread, daemon=True).start()
-
-    # ----- Misc -----
-
-    def set_status(self, text):
-        self.status_var.set(text)
 
 
 def main():
