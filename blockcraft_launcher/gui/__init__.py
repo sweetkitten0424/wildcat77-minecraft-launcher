@@ -1,1 +1,1 @@
-"""Tkinter UI for BlockCraft Launcher."""
+"""Tkinter UI for The Angel Launcher (TAL)."""

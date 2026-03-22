@@ -253,7 +253,7 @@ class MinecraftLauncherApp:
             return
 
         self.console_window = Toplevel(self.root)
-        self.console_window.title("BlockCraft Launcher Console")
+        self.console_window.title("The Angel Launcher Console")
         self.console_window.geometry("900x450")
         self.console_window.configure(bg="#1c2413")
 
@@ -359,7 +359,7 @@ class MinecraftLauncherApp:
         if self.console_text is None:
             return
         content = self.console_text.get("1.0", END)
-        default_name = f"BlockCraftConsole_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        default_name = f"TAL_Console_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         path = filedialog.asksaveasfilename(
             title="Save console log",
             defaultextension=".log",

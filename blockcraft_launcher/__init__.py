@@ -1,1 +1,1 @@
-"""BlockCraft Launcher package."""
+"""The Angel Launcher (TAL) package."""

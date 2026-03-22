@@ -1,4 +1,4 @@
-APP_NAME = "BlockCraft Launcher"
+APP_NAME = "The Angel Launcher"
 LAUNCHER_VERSION = "1.3.1"
 
 # Java runtime (bundled)
