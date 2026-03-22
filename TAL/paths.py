@@ -1,8 +1,7 @@
 from pathlib import Path
 
 
-# Installation directory (this is USERDIR). The package lives in USERDIR/blockcraft_launcher.
-# (Package folder name is independent of the launcher display name.)
+# Installation directory (this is USERDIR). The package lives in USERDIR/TAL.
 INSTALL_DIR = Path(__file__).resolve().parent.parent
 
 MODPACKS_DIR = INSTALL_DIR / "modpacks"

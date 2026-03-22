@@ -1,4 +1,4 @@
-from blockcraft_launcher.gui.app import main
+from TAL.gui.app import main
 
 
 if __name__ == "__main__":
