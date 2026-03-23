@@ -5,7 +5,13 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from ..constants import CURSEFORGE_API_KEY, CURSEFORGE_GAME_ID_MINECRAFT, CURSEFORGE_MODLOADER_TYPE_IDS
+from ..constants import (
+    CURSEFORGE_API_KEY,
+    CURSEFORGE_CORE_API_HOST,
+    CURSEFORGE_CORE_API_URL,
+    CURSEFORGE_GAME_ID_MINECRAFT,
+    CURSEFORGE_MODLOADER_TYPE_IDS,
+)
 from ..downloads import download_to_file
 from ..instance import normalize_loader_name
 
@@ -15,9 +21,10 @@ def api_request(path: str) -> dict:
     if not api_key:
         raise RuntimeError("CURSEFORGE_API_KEY is empty.")
 
-    url = "https://api.curseforge.com" + path
+    url = CURSEFORGE_CORE_API_URL.rstrip("/") + "/" + path.lstrip("/")
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/json")
+    req.add_header("Host", CURSEFORGE_CORE_API_HOST)
     req.add_header("x-api-key", api_key)
 
     with urllib.request.urlopen(req) as resp:
@@ -43,8 +50,9 @@ def resolve_project(text: str) -> int:
             "pageSize": 1,
         }
     )
-    data = api_request(f"/v1/mods/search?{q}")
+    data = api_request(f"mods/search?{q}")
     mods = data.get("data") or []
+ []
     if not mods:
         raise RuntimeError(f"CurseForge project not found for '{text}'.")
     return int(mods[0]["id"])
@@ -63,14 +71,14 @@ def pick_file_for_mod(mod_id: int, target_mc_version: Optional[str], target_load
 
     if query:
         try:
-            data = api_request(f"/v1/mods/{mod_id}/files?{urllib.parse.urlencode(query)}")
+            data = api_request(f"mods/{mod_id}/files?{urllib.parse.urlencode(query)}")
             files = data.get("data", [])
             if files:
                 return files[0]
         except Exception:
             pass
 
-    data = api_request(f"/v1/mods/{mod_id}/files")
+    data = api_request(f"mods/{mod_id}/files")
     files = data.get("data", [])
     if not files:
         raise RuntimeError(f"No files found for CurseForge mod id={mod_id}.")
